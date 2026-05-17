@@ -22,16 +22,24 @@ import carb
 import numpy as np
 import omni
 import omni.appwindow  # Contains handle to keyboard
+import omni.client
 import omni.graph.core as og
 import omni.kit.commands
 import omni.replicator.core as rep
 import usdrt.Sdf
+from pathlib import Path
 from isaacsim.core.api import World
 from isaacsim.core.utils.extensions import enable_extension
 from isaacsim.core.utils.semantics import add_labels
+from isaacsim.core.utils.stage import add_reference_to_stage
 from isaacsim.robot.policy.examples.robots import AnymalFlatTerrainPolicy
+from isaacsim.storage.native import get_assets_root_path
 from pxr import Gf, Sdf, Usd, UsdGeom, UsdLux, UsdPhysics, UsdShade
 
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_GUARD_TOWER_ASSET = PROJECT_ROOT / "assets/props/guard_tower/Guard_Tower_Free_Asset.usdz"
+DEFAULT_CHAINLINK_FENCE_ASSET = PROJECT_ROOT / "assets/props/chainlink_fence/chainlink_fence_tileable.usdz"
 
 parser = argparse.ArgumentParser()
 parser.add_argument(
@@ -50,7 +58,7 @@ parser.add_argument(
 parser.add_argument(
     "--terrain-grid-step",
     type=float,
-    default=4.0,
+    default=0.0,
     help="Spacing in meters for the dark visual grid drawn on top of the terrain. Set <= 0 to hide it.",
 )
 parser.add_argument("--trail-width", type=float, default=5.0, help="Width of the smoother patrol trail in meters.")
@@ -65,9 +73,28 @@ parser.add_argument(
     "--terrain-texture",
     type=str,
     default="",
-    help="Optional PNG/JPG satellite or orthophoto texture to map over the terrain.",
+    help="Optional PNG/JPG satellite, orthophoto, or PBR albedo texture to map over the terrain.",
+)
+parser.add_argument(
+    "--terrain-normal-texture",
+    type=str,
+    default="",
+    help="Optional PBR normal map for the terrain material.",
+)
+parser.add_argument(
+    "--terrain-roughness-texture",
+    type=str,
+    default="",
+    help="Optional PBR roughness map for the terrain material.",
+)
+parser.add_argument(
+    "--terrain-texture-scale",
+    type=float,
+    default=1.0,
+    help="UV tiling scale for terrain textures. Use 1.0 for orthophoto/satellite images, larger values for tiled PBR materials.",
 )
 parser.add_argument("--no-ros2-sensors", action="store_true", help="Disable ROS 2 camera, LiDAR, TF, and clock publishers.")
+parser.add_argument("--no-ros2-lidar", action="store_true", help="Disable only the ROS 2 RTX LiDAR publisher.")
 parser.add_argument("--no-ros2-cmd-vel", action="store_true", help="Disable ROS 2 /cmd_vel control subscriber.")
 parser.add_argument("--no-ros2-odom", action="store_true", help="Disable ROS 2 /odom publishing.")
 parser.add_argument("--cmd-vel-topic", type=str, default="cmd_vel", help="ROS 2 Twist topic used to command ANYmal.")
@@ -96,16 +123,103 @@ parser.add_argument(
     help="Use world for a fixed RTX LiDAR debug pose, robot for direct child mount, or follow for experimental ANYmal tracking.",
 )
 parser.add_argument("--no-intruder", action="store_true", help="Disable the moving intruder scenario.")
-parser.add_argument("--intruder-count", type=int, default=1, help="Number of moving intruder targets to spawn.")
+parser.add_argument("--intruder-count", type=int, default=3, help="Number of moving intruder targets to spawn.")
 parser.add_argument("--intruder-speed", type=float, default=0.45, help="Intruder approach speed in meters per second.")
 parser.add_argument("--intruder-seed", type=int, default=31, help="Seed for deterministic intruder spawn positions.")
+parser.add_argument(
+    "--intruder-visual",
+    choices=("auto", "isaac-human", "primitive"),
+    default="auto",
+    help="Intruder visual source. auto tries Isaac human USD assets and falls back to primitive.",
+)
+parser.add_argument(
+    "--intruder-human-usd",
+    type=str,
+    default="",
+    help="Optional explicit human USD path or URL for intruder visuals.",
+)
+parser.add_argument(
+    "--intruder-yaw-deg",
+    type=float,
+    default=0.0,
+    help="Yaw rotation applied to the intruder visual in degrees. Use 180 if the human asset faces backward.",
+)
 parser.add_argument("--no-gp-props", action="store_true", help="Disable lightweight GP visual props.")
+parser.add_argument("--no-external-props", action="store_true", help="Disable external USD/USDZ prop assets.")
+parser.add_argument(
+    "--guard-tower-asset",
+    type=str,
+    default=str(DEFAULT_GUARD_TOWER_ASSET),
+    help="Optional USD/USDZ guard tower asset to place near the fence.",
+)
+parser.add_argument(
+    "--guard-tower-scale",
+    type=float,
+    default=1.0,
+    help="Uniform scale for the external guard tower asset.",
+)
+parser.add_argument(
+    "--fence-asset",
+    type=str,
+    default=str(DEFAULT_CHAINLINK_FENCE_ASSET),
+    help="Optional USD/USDZ chainlink fence tile asset to repeat along the fence line.",
+)
+parser.add_argument(
+    "--fence-asset-scale",
+    type=float,
+    default=1.0,
+    help="Uniform scale for the external chainlink fence tile asset.",
+)
+parser.add_argument(
+    "--fence-asset-count",
+    type=int,
+    default=12,
+    help="Number of external fence tiles repeated along the main fence line.",
+)
+parser.add_argument(
+    "--no-ground-detail",
+    action="store_true",
+    help="Disable procedural dirt, gravel, and grass overlays. Use this with real orthophoto or tiled PBR terrain textures.",
+)
 parser.add_argument("--terrain-seed", type=int, default=7, help="Seed for deterministic terrain noise.")
+parser.add_argument(
+    "--replicator-dataset",
+    action="store_true",
+    help="Generate a small Replicator RGB + 2D bbox dataset preview, then exit.",
+)
+parser.add_argument(
+    "--dataset-frames",
+    type=int,
+    default=60,
+    help="Number of synthetic frames to capture when --replicator-dataset is enabled.",
+)
+parser.add_argument(
+    "--dataset-output-dir",
+    type=str,
+    default=str(PROJECT_ROOT / "datasets/person_preview_replicator"),
+    help="Output directory for Replicator preview data.",
+)
+parser.add_argument("--dataset-width", type=int, default=640, help="Replicator dataset image width.")
+parser.add_argument("--dataset-height", type=int, default=480, help="Replicator dataset image height.")
+parser.add_argument("--dataset-seed", type=int, default=20260517, help="Seed for dataset camera randomization.")
+parser.add_argument(
+    "--dataset-profile",
+    choices=("fence", "clear", "hard", "mixed", "calibration"),
+    default="fence",
+    help=(
+        "Camera sampling profile for Replicator data. calibration mixes clear person views, "
+        "fence-occluded views, and hard long-angle views."
+    ),
+)
 args, unknown = parser.parse_known_args()
 
 if not args.no_ros2_sensors or not args.no_ros2_cmd_vel or not args.no_ros2_odom:
     enable_extension("isaacsim.ros2.bridge")
     enable_extension("isaacsim.sensors.rtx")
+    simulation_app.update()
+
+if not args.no_intruder and args.intruder_visual in ("auto", "isaac-human"):
+    enable_extension("omni.anim.people")
     simulation_app.update()
 
 FRONT_CAMERA_NAME = "SentryFrontCamera"
@@ -114,6 +228,12 @@ FRONT_CAMERA_TRANSLATION = (0.95, 0.0, 0.64)
 # USD camera local -Z looks forward. This quaternion points it along robot +X
 # while keeping robot +Z as image up, so the viewport is not rolled sideways.
 FRONT_CAMERA_ORIENTATION_IJKR = (0.5, -0.5, -0.5, 0.5)
+DEFAULT_INTRUDER_HUMAN_ASSETS = (
+    "original_female_adult_business_02",
+    "original_male_adult_business_02",
+    "original_male_adult_construction_05",
+    "original_male_adult_construction_02",
+)
 
 
 def _smoothstep(value: np.ndarray) -> np.ndarray:
@@ -179,40 +299,73 @@ def _generate_heightfield(
     return x_values, y_values, heights
 
 
-def _add_terrain_uvs(mesh: UsdGeom.Mesh, x_values: np.ndarray, y_values: np.ndarray) -> None:
+def _add_terrain_uvs(mesh: UsdGeom.Mesh, x_values: np.ndarray, y_values: np.ndarray, texture_scale: float) -> None:
     x_min = float(x_values[0])
     x_range = float(x_values[-1] - x_values[0])
     y_min = float(y_values[0])
     y_range = float(y_values[-1] - y_values[0])
+    texture_scale = max(0.001, float(texture_scale))
     texcoords = [
-        Gf.Vec2f(float((x - x_min) / x_range), float((y - y_min) / y_range)) for y in y_values for x in x_values
+        Gf.Vec2f(float((x - x_min) / x_range * texture_scale), float((y - y_min) / y_range * texture_scale))
+        for y in y_values
+        for x in x_values
     ]
     primvars_api = UsdGeom.PrimvarsAPI(mesh.GetPrim())
     st = primvars_api.CreatePrimvar("st", Sdf.ValueTypeNames.TexCoord2fArray, UsdGeom.Tokens.vertex)
     st.Set(texcoords)
 
 
-def _bind_terrain_texture(stage, terrain_prim, texture_path: str) -> None:
-    if not texture_path:
+def _bind_terrain_texture(
+    stage,
+    terrain_prim,
+    texture_path: str,
+    normal_texture_path: str,
+    roughness_texture_path: str,
+) -> None:
+    if not texture_path and not normal_texture_path and not roughness_texture_path:
         return
 
-    material = UsdShade.Material.Define(stage, Sdf.Path("/World/Looks/GP_TerrainSatelliteMaterial"))
-    shader = UsdShade.Shader.Define(stage, Sdf.Path("/World/Looks/GP_TerrainSatelliteMaterial/PreviewSurface"))
+    material = UsdShade.Material.Define(stage, Sdf.Path("/World/Looks/GP_TerrainPBRMaterial"))
+    shader = UsdShade.Shader.Define(stage, Sdf.Path("/World/Looks/GP_TerrainPBRMaterial/PreviewSurface"))
     shader.CreateIdAttr("UsdPreviewSurface")
     shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.92)
     shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(0.0)
+    shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(0.17, 0.18, 0.12))
 
-    st_reader = UsdShade.Shader.Define(stage, Sdf.Path("/World/Looks/GP_TerrainSatelliteMaterial/StReader"))
+    st_reader = UsdShade.Shader.Define(stage, Sdf.Path("/World/Looks/GP_TerrainPBRMaterial/StReader"))
     st_reader.CreateIdAttr("UsdPrimvarReader_float2")
     st_reader.CreateInput("varname", Sdf.ValueTypeNames.Token).Set("st")
 
-    texture = UsdShade.Shader.Define(stage, Sdf.Path("/World/Looks/GP_TerrainSatelliteMaterial/SatelliteTexture"))
-    texture.CreateIdAttr("UsdUVTexture")
-    texture.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath(texture_path))
-    texture.CreateInput("st", Sdf.ValueTypeNames.Float2).ConnectToSource(st_reader.ConnectableAPI(), "result")
-    texture.CreateOutput("rgb", Sdf.ValueTypeNames.Float3)
+    if texture_path:
+        texture = UsdShade.Shader.Define(stage, Sdf.Path("/World/Looks/GP_TerrainPBRMaterial/AlbedoTexture"))
+        texture.CreateIdAttr("UsdUVTexture")
+        texture.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath(texture_path))
+        texture.CreateInput("st", Sdf.ValueTypeNames.Float2).ConnectToSource(st_reader.ConnectableAPI(), "result")
+        texture.CreateInput("wrapS", Sdf.ValueTypeNames.Token).Set("repeat")
+        texture.CreateInput("wrapT", Sdf.ValueTypeNames.Token).Set("repeat")
+        texture.CreateOutput("rgb", Sdf.ValueTypeNames.Float3)
+        shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).ConnectToSource(texture.ConnectableAPI(), "rgb")
 
-    shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).ConnectToSource(texture.ConnectableAPI(), "rgb")
+    if roughness_texture_path:
+        roughness_texture = UsdShade.Shader.Define(stage, Sdf.Path("/World/Looks/GP_TerrainPBRMaterial/RoughnessTexture"))
+        roughness_texture.CreateIdAttr("UsdUVTexture")
+        roughness_texture.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath(roughness_texture_path))
+        roughness_texture.CreateInput("st", Sdf.ValueTypeNames.Float2).ConnectToSource(st_reader.ConnectableAPI(), "result")
+        roughness_texture.CreateInput("wrapS", Sdf.ValueTypeNames.Token).Set("repeat")
+        roughness_texture.CreateInput("wrapT", Sdf.ValueTypeNames.Token).Set("repeat")
+        roughness_texture.CreateOutput("r", Sdf.ValueTypeNames.Float)
+        shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).ConnectToSource(roughness_texture.ConnectableAPI(), "r")
+
+    if normal_texture_path:
+        normal_texture = UsdShade.Shader.Define(stage, Sdf.Path("/World/Looks/GP_TerrainPBRMaterial/NormalTexture"))
+        normal_texture.CreateIdAttr("UsdUVTexture")
+        normal_texture.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath(normal_texture_path))
+        normal_texture.CreateInput("st", Sdf.ValueTypeNames.Float2).ConnectToSource(st_reader.ConnectableAPI(), "result")
+        normal_texture.CreateInput("wrapS", Sdf.ValueTypeNames.Token).Set("repeat")
+        normal_texture.CreateInput("wrapT", Sdf.ValueTypeNames.Token).Set("repeat")
+        normal_texture.CreateOutput("rgb", Sdf.ValueTypeNames.Float3)
+        shader.CreateInput("normal", Sdf.ValueTypeNames.Normal3f).ConnectToSource(normal_texture.ConnectableAPI(), "rgb")
+
     material.CreateSurfaceOutput().ConnectToSource(shader.ConnectableAPI(), "surface")
     UsdShade.MaterialBindingAPI.Apply(terrain_prim).Bind(material)
 
@@ -357,6 +510,124 @@ def _add_curve_lines(stage, path: str, lines, width: float, color) -> None:
     curves.CreateDisplayColorAttr([Gf.Vec3f(*color)])
 
 
+def _add_sphere_light(stage, path: str, center, radius: float, intensity: float, color) -> None:
+    light = UsdLux.SphereLight.Define(stage, Sdf.Path(path))
+    light.CreateRadiusAttr(radius)
+    light.CreateIntensityAttr(intensity)
+    light.CreateColorAttr(Gf.Vec3f(*color))
+    _set_xform(light.GetPrim(), center)
+
+
+def _add_concertina_wire(
+    stage,
+    path: str,
+    x_values: np.ndarray,
+    y_values: np.ndarray,
+    heights: np.ndarray,
+    x_min: float,
+    x_max: float,
+    center_y: float,
+    center_z_offset: float,
+    radius: float,
+    loops: int,
+    width: float,
+    color,
+) -> None:
+    points = []
+    sample_count = max(80, loops * 18)
+    for idx, x in enumerate(np.linspace(x_min, x_max, sample_count)):
+        angle = 2.0 * np.pi * loops * idx / max(1, sample_count - 1)
+        ground_z = _sample_height(x_values, y_values, heights, x, center_y)
+        y = center_y + radius * np.cos(angle)
+        z = ground_z + center_z_offset + radius * np.sin(angle)
+        points.append((float(x), float(y), float(z)))
+    _add_curve_lines(stage, path, [points], width=width, color=color)
+
+
+def _add_ground_surface_variation(
+    stage,
+    x_values: np.ndarray,
+    y_values: np.ndarray,
+    heights: np.ndarray,
+    terrain_size: float,
+    fence_y: float,
+) -> None:
+    rng = np.random.default_rng(20260517)
+    stage.DefinePrim("/World/GP_GroundDetail", "Xform")
+
+    x_limit = terrain_size * 0.43
+    interior_y_min = -terrain_size * 0.42
+    interior_y_max = fence_y - 1.5
+    fence_y_max = fence_y + 2.8
+
+    dirt_palette = (
+        (0.19, 0.16, 0.10),
+        (0.23, 0.19, 0.12),
+        (0.15, 0.13, 0.09),
+        (0.27, 0.23, 0.15),
+    )
+    grass_palette = (
+        (0.11, 0.16, 0.07),
+        (0.15, 0.20, 0.08),
+        (0.08, 0.13, 0.06),
+        (0.20, 0.22, 0.10),
+    )
+    gravel_palette = (
+        (0.28, 0.27, 0.24),
+        (0.20, 0.20, 0.18),
+        (0.35, 0.33, 0.29),
+    )
+
+    for idx in range(34):
+        x = float(rng.uniform(-x_limit, x_limit))
+        y = float(rng.uniform(interior_y_min, fence_y_max))
+        if abs(y) < 3.2 and abs(x) < 8.0:
+            y += 5.5
+        z = _sample_height(x_values, y_values, heights, x, y)
+        sx = float(rng.uniform(1.4, 4.8))
+        sy = float(rng.uniform(0.7, 2.4))
+        color = dirt_palette[idx % len(dirt_palette)]
+        _add_visual_cube(
+            stage,
+            f"/World/GP_GroundDetail/BareSoilPatch_{idx}",
+            (x, y, z + 0.018),
+            (sx, sy, 0.018),
+            color,
+            rotate_xyz=(0.0, 0.0, float(rng.uniform(-35.0, 35.0))),
+        )
+
+    for idx in range(24):
+        x = float(rng.uniform(-x_limit, x_limit))
+        y = float(rng.uniform(interior_y_min, interior_y_max))
+        z = _sample_height(x_values, y_values, heights, x, y)
+        color = gravel_palette[idx % len(gravel_palette)]
+        _add_visual_cube(
+            stage,
+            f"/World/GP_GroundDetail/GravelPatch_{idx}",
+            (x, y, z + 0.024),
+            (float(rng.uniform(0.45, 1.2)), float(rng.uniform(0.25, 0.75)), 0.020),
+            color,
+            rotate_xyz=(0.0, 0.0, float(rng.uniform(-45.0, 45.0))),
+        )
+
+    for idx in range(72):
+        x = float(rng.uniform(-x_limit, x_limit))
+        y = float(rng.uniform(interior_y_min, fence_y + 3.0))
+        if -6.5 < y < -3.4:
+            continue
+        z = _sample_height(x_values, y_values, heights, x, y)
+        height = float(rng.uniform(0.12, 0.42))
+        color = grass_palette[idx % len(grass_palette)]
+        _add_visual_cube(
+            stage,
+            f"/World/GP_GroundDetail/GrassClump_{idx}",
+            (x, y, z + height * 0.5),
+            (float(rng.uniform(0.06, 0.14)), float(rng.uniform(0.04, 0.10)), height),
+            color,
+            rotate_xyz=(float(rng.uniform(-6.0, 6.0)), float(rng.uniform(-5.0, 5.0)), float(rng.uniform(0.0, 180.0))),
+        )
+
+
 def _add_river(
     stage,
     x_values: np.ndarray,
@@ -388,30 +659,241 @@ def _add_river(
     )
 
 
-def _create_intruder_visual(stage, path: str) -> dict:
+def _add_external_prop_reference(
+    stage,
+    prim_path: str,
+    asset_path: str,
+    center,
+    scale: float,
+    rotate_xyz=(0.0, 0.0, 0.0),
+    label: str | None = None,
+) -> bool:
+    if not asset_path:
+        return False
+
+    resolved_path = str(Path(asset_path).expanduser())
+    if not Path(resolved_path).exists():
+        carb.log_warn(f"External prop asset not found: {resolved_path}")
+        return False
+
+    try:
+        root_prim = add_reference_to_stage(usd_path=resolved_path, prim_path=prim_path)
+    except Exception as exc:
+        carb.log_warn(f"Failed to add external prop '{resolved_path}': {exc}")
+        return False
+
+    if root_prim is None or not root_prim.IsValid():
+        carb.log_warn(f"External prop did not create a valid prim: {resolved_path}")
+        return False
+
+    xformable = UsdGeom.Xformable(root_prim)
+    xformable.ClearXformOpOrder()
+    xformable.AddTranslateOp().Set(Gf.Vec3f(*[float(value) for value in center]))
+    xformable.AddRotateXYZOp().Set(Gf.Vec3f(*[float(value) for value in rotate_xyz]))
+    xformable.AddScaleOp().Set(Gf.Vec3f(float(scale), float(scale), float(scale)))
+    if label:
+        _label_prim_tree(root_prim, label)
+    print(f"Loaded external prop: {resolved_path} -> {prim_path}")
+    return True
+
+
+def _enable_alpha_cutout_for_prop(root_prim, threshold: float = 0.43) -> None:
+    alpha_texture = None
+    preview_shaders = []
+
+    for prim in Usd.PrimRange(root_prim):
+        if prim.GetTypeName() != "Shader":
+            continue
+        shader = UsdShade.Shader(prim)
+        shader_id = shader.GetIdAttr().Get()
+        if shader_id == "UsdPreviewSurface":
+            preview_shaders.append(shader)
+        elif shader_id == "UsdUVTexture":
+            file_input = shader.GetInput("file")
+            texture_file = file_input.Get() if file_input else None
+            texture_file_str = str(texture_file).lower() if texture_file is not None else ""
+            if "basecolor" in texture_file_str or "cutoff" in texture_file_str or "alpha" in texture_file_str:
+                alpha_texture = shader
+
+    if alpha_texture is not None:
+        alpha_texture.CreateOutput("a", Sdf.ValueTypeNames.Float)
+
+    for shader in preview_shaders:
+        shader.CreateInput("opacityThreshold", Sdf.ValueTypeNames.Float).Set(float(threshold))
+        if alpha_texture is not None:
+            shader.CreateInput("opacity", Sdf.ValueTypeNames.Float).ConnectToSource(
+                alpha_texture.ConnectableAPI(),
+                "a",
+            )
+
+
+def _add_external_gp_props(
+    stage,
+    x_values: np.ndarray,
+    y_values: np.ndarray,
+    heights: np.ndarray,
+    terrain_size: float,
+    fence_y: float,
+    guard_tower_asset: str,
+    guard_tower_scale: float,
+    fence_asset: str,
+    fence_asset_scale: float,
+    fence_asset_count: int,
+) -> None:
+    stage.DefinePrim("/World/GP_ExternalProps", "Xform")
+    fence_y = _get_fence_y(terrain_size, fence_y)
+
+    for tower_idx, tower_x in enumerate((-terrain_size * 0.31, terrain_size * 0.31)):
+        tower_y = fence_y - 6.0
+        tower_z = _sample_height(x_values, y_values, heights, tower_x, tower_y)
+        _add_external_prop_reference(
+            stage,
+            f"/World/GP_ExternalProps/GuardTower_{tower_idx}",
+            guard_tower_asset,
+            (float(tower_x), float(tower_y), float(tower_z)),
+            guard_tower_scale,
+            rotate_xyz=(0.0, 0.0, 0.0 if tower_idx == 0 else 180.0),
+            label="guard_tower",
+        )
+
+    count = max(0, int(fence_asset_count))
+    if count > 0:
+        x_min = -terrain_size * 0.40
+        x_max = terrain_size * 0.40
+        for tile_idx, x in enumerate(np.linspace(x_min, x_max, count)):
+            tile_y = fence_y
+            tile_z = _sample_height(x_values, y_values, heights, x, tile_y)
+            _add_external_prop_reference(
+                stage,
+                f"/World/GP_ExternalProps/ChainlinkFenceTile_{tile_idx}",
+                fence_asset,
+                (float(x), float(tile_y), float(tile_z)),
+                fence_asset_scale,
+                rotate_xyz=(0.0, 0.0, 0.0),
+                label="fence",
+            )
+            fence_prim = stage.GetPrimAtPath(f"/World/GP_ExternalProps/ChainlinkFenceTile_{tile_idx}")
+            if fence_prim.IsValid():
+                _enable_alpha_cutout_for_prop(fence_prim)
+
+
+def _label_prim_tree(prim, label: str) -> None:
+    if not prim.IsValid():
+        return
+    for child in Usd.PrimRange(prim):
+        _apply_class_label(child, label)
+
+
+def _join_asset_url(root: str, relative_path: str) -> str:
+    return root.rstrip("/") + "/" + relative_path.lstrip("/")
+
+
+def _find_first_usd_in_asset_folder(folder_url: str) -> str | None:
+    result, items = omni.client.list(folder_url)
+    if result != omni.client.Result.OK:
+        carb.log_warn(f"Unable to read Isaac character folder: {folder_url}")
+        return None
+
+    for item in items:
+        if item.relative_path.lower().endswith(".usd"):
+            return _join_asset_url(folder_url, item.relative_path)
+    carb.log_warn(f"No USD file found in Isaac character folder: {folder_url}")
+    return None
+
+
+def _resolve_intruder_human_usd(character_or_path: str) -> str | None:
+    if not character_or_path:
+        return None
+
+    local_path = Path(character_or_path).expanduser()
+    if local_path.exists():
+        return str(local_path)
+
+    assets_root_path = get_assets_root_path()
+    if assets_root_path is None:
+        carb.log_warn("Isaac asset root not found; using primitive intruder visual.")
+        return None
+
+    if character_or_path.lower().endswith(".usd"):
+        if character_or_path.startswith("/Isaac/"):
+            return _join_asset_url(assets_root_path, character_or_path)
+        return character_or_path
+
+    character_folder = _join_asset_url(assets_root_path, f"/Isaac/People/Characters/{character_or_path}")
+    return _find_first_usd_in_asset_folder(character_folder)
+
+
+def _get_default_intruder_human_usd() -> str | None:
+    for character_name in DEFAULT_INTRUDER_HUMAN_ASSETS:
+        character_usd = _resolve_intruder_human_usd(character_name)
+        if character_usd is not None:
+            return character_usd
+    carb.log_warn("No built-in Isaac people assets were found; using primitive intruder visual.")
+    return None
+
+
+def _create_isaac_human_intruder_visual(stage, path: str, human_usd_path: str, yaw_deg: float) -> dict | None:
+    if not human_usd_path:
+        return None
+    try:
+        root_prim = add_reference_to_stage(usd_path=human_usd_path, prim_path=path)
+    except Exception as exc:
+        carb.log_warn(f"Failed to add human intruder USD '{human_usd_path}': {exc}")
+        return None
+
+    if root_prim is None or not root_prim.IsValid():
+        carb.log_warn(f"Human intruder USD did not create a valid prim: {human_usd_path}")
+        return None
+
+    _label_prim_tree(root_prim, "person")
+    xformable = UsdGeom.Xformable(root_prim)
+    xformable.ClearXformOpOrder()
+    translate_op = xformable.AddTranslateOp(UsdGeom.XformOp.PrecisionDouble)
+    # Keep the root transform simple so the same motion controller can move
+    # both referenced human USDs and the primitive fallback.
+    xformable.AddRotateXYZOp(UsdGeom.XformOp.PrecisionDouble).Set(Gf.Vec3d(0.0, 0.0, float(yaw_deg)))
+    print(f"Using Isaac human intruder asset: {human_usd_path}")
+    return {"prim": root_prim, "translate_op": translate_op, "visual_type": "isaac-human"}
+
+
+def _create_primitive_intruder_visual(stage, path: str) -> dict:
     root = UsdGeom.Xform.Define(stage, Sdf.Path(path))
     root_prim = root.GetPrim()
     _apply_class_label(root_prim, "person")
 
-    clothing = (0.10, 0.17, 0.12)
-    vest = (0.18, 0.21, 0.15)
+    clothing = (0.20, 0.19, 0.15)
+    pack = (0.13, 0.10, 0.07)
     skin = (0.48, 0.35, 0.26)
-    dark = (0.04, 0.045, 0.04)
-    alert = (0.75, 0.10, 0.08)
+    hair = (0.035, 0.030, 0.025)
+    pants = (0.07, 0.075, 0.08)
 
     _add_visual_cube(stage, f"{path}/Torso", (0.0, 0.0, 0.95), (0.38, 0.22, 0.62), clothing, "person")
-    _add_visual_cube(stage, f"{path}/Vest", (0.0, -0.015, 1.03), (0.42, 0.08, 0.42), vest, "person")
+    _add_visual_cube(stage, f"{path}/Backpack", (0.0, 0.12, 1.00), (0.36, 0.12, 0.48), pack, "person")
+    _add_visual_cube(stage, f"{path}/ChestBag", (0.0, -0.115, 1.02), (0.24, 0.045, 0.28), pack, "person")
     _add_visual_sphere(stage, f"{path}/Head", (0.0, 0.0, 1.45), 0.16, skin, "person")
-    _add_visual_sphere(stage, f"{path}/Helmet", (0.0, 0.0, 1.57), 0.17, dark, "person")
+    _add_visual_sphere(stage, f"{path}/Hair", (0.0, 0.0, 1.57), 0.15, hair, "person")
     _add_visual_cube(stage, f"{path}/LeftArm", (-0.31, 0.0, 0.96), (0.11, 0.12, 0.55), clothing, "person", rotate_xyz=(0.0, 0.0, -8.0))
     _add_visual_cube(stage, f"{path}/RightArm", (0.31, 0.0, 0.96), (0.11, 0.12, 0.55), clothing, "person", rotate_xyz=(0.0, 0.0, 8.0))
-    _add_visual_cube(stage, f"{path}/LeftLeg", (-0.12, 0.0, 0.36), (0.13, 0.13, 0.68), dark, "person")
-    _add_visual_cube(stage, f"{path}/RightLeg", (0.12, 0.0, 0.36), (0.13, 0.13, 0.68), dark, "person")
-    _add_visual_cube(stage, f"{path}/DetectionMarker", (0.0, 0.0, 1.88), (0.55, 0.05, 0.10), alert, "person")
+    _add_visual_cube(stage, f"{path}/LeftLeg", (-0.12, 0.0, 0.36), (0.13, 0.13, 0.68), pants, "person")
+    _add_visual_cube(stage, f"{path}/RightLeg", (0.12, 0.0, 0.36), (0.13, 0.13, 0.68), pants, "person")
 
     xformable = UsdGeom.Xformable(root_prim)
     translate_op = xformable.AddTranslateOp()
-    return {"prim": root_prim, "translate_op": translate_op}
+    return {"prim": root_prim, "translate_op": translate_op, "visual_type": "primitive"}
+
+
+def _create_intruder_visual(stage, path: str, visual_mode: str, human_usd_path: str, yaw_deg: float) -> dict:
+    if visual_mode in ("auto", "isaac-human"):
+        resolved_human_usd_path = (
+            _resolve_intruder_human_usd(human_usd_path) if human_usd_path else _get_default_intruder_human_usd()
+        )
+        handles = _create_isaac_human_intruder_visual(stage, path, resolved_human_usd_path, yaw_deg)
+        if handles is not None:
+            return handles
+        if visual_mode == "isaac-human":
+            carb.log_warn("Requested Isaac human intruder visual, but loading failed. Falling back to primitive.")
+
+    return _create_primitive_intruder_visual(stage, path)
 
 
 class IntruderScenario:
@@ -427,6 +909,9 @@ class IntruderScenario:
         count: int,
         speed: float,
         seed: int,
+        visual_mode: str,
+        human_usd_path: str,
+        yaw_deg: float,
     ) -> None:
         self._stage = stage
         self._x_values = x_values
@@ -438,11 +923,16 @@ class IntruderScenario:
         self._speed = max(0.0, float(speed))
         self._rng = np.random.default_rng(seed)
         self._intruders = []
+        self._visual_mode = visual_mode
+        self._human_usd_path = human_usd_path
+        self._yaw_deg = float(yaw_deg)
+        self._visual_types = set()
 
         stage.DefinePrim("/World/Intruders", "Xform")
         for index in range(max(0, int(count))):
             path = f"/World/Intruders/Intruder_{index}"
-            handles = _create_intruder_visual(stage, path)
+            handles = _create_intruder_visual(stage, path, self._visual_mode, self._human_usd_path, self._yaw_deg)
+            self._visual_types.add(handles.get("visual_type", "unknown"))
             state = {
                 "path": path,
                 "translate_op": handles["translate_op"],
@@ -455,13 +945,13 @@ class IntruderScenario:
         if self._intruders:
             print(
                 f"Intruder scenario enabled: count={len(self._intruders)}, "
-                f"speed={self._speed:.2f} m/s, label=person"
+                f"speed={self._speed:.2f} m/s, visual={','.join(sorted(self._visual_types))}, label=person"
             )
 
     def _respawn_intruder(self, state: dict) -> None:
         x_limit = self._terrain_size * 0.30
-        start_y_min = min(self._y_values[-1] - 2.0, self._fence_y + max(5.0, self._river_width * 0.38))
-        start_y_max = min(self._y_values[-1] - 1.0, self._fence_y + max(8.0, self._river_width * 0.72))
+        start_y_min = min(self._y_values[-1] - 2.0, self._fence_y + 2.0)
+        start_y_max = min(self._y_values[-1] - 1.0, self._fence_y + max(4.5, self._river_width * 0.28))
         if start_y_max <= start_y_min:
             start_y_max = start_y_min + 0.5
 
@@ -473,6 +963,29 @@ class IntruderScenario:
         state["arrived"] = False
         state["hold_time"] = 0.0
         self._set_intruder_pose(state)
+
+    def randomize_for_dataset(self) -> list[np.ndarray]:
+        positions = []
+        if not self._intruders:
+            return positions
+
+        x_limit = self._terrain_size * 0.34
+        start_y_min = min(self._y_values[-1] - 2.0, self._fence_y + 1.6)
+        start_y_max = min(self._y_values[-1] - 1.0, self._fence_y + max(4.2, self._river_width * 0.30))
+        if start_y_max <= start_y_min:
+            start_y_max = start_y_min + 0.5
+
+        for state in self._intruders:
+            x = float(self._rng.uniform(-x_limit, x_limit))
+            y = float(self._rng.uniform(start_y_min, start_y_max))
+            state["position"] = np.array([x, y, 0.0], dtype=float)
+            state["target_y"] = float(self._fence_y + 1.0)
+            state["arrived"] = False
+            state["hold_time"] = 0.0
+            state["time"] = float(self._rng.uniform(0.0, 4.0))
+            self._set_intruder_pose(state)
+            positions.append(state["position"].copy())
+        return positions
 
     def _set_intruder_pose(self, state: dict) -> None:
         position = state["position"]
@@ -508,6 +1021,7 @@ def _add_gp_props(
     terrain_size: float,
     fence_y: float,
     river_width: float,
+    skip_watchtowers: bool = False,
 ) -> None:
     stage.DefinePrim("/World/GP_Props", "Xform")
     fence_y = _get_fence_y(terrain_size, fence_y)
@@ -544,6 +1058,73 @@ def _add_gp_props(
 
     _add_curve_lines(stage, "/World/GP_Props/FenceWires", wire_lines, width=0.025, color=(0.05, 0.06, 0.05))
 
+    mesh_lines = []
+    for mesh_idx, x in enumerate(np.arange(x_min, x_max - post_spacing, post_spacing)):
+        for base_height, top_height in ((0.55, 1.15), (1.15, 1.75), (1.75, 2.25)):
+            z0 = _sample_height(x_values, y_values, heights, x, fence_y)
+            z1 = _sample_height(x_values, y_values, heights, x + post_spacing, fence_y)
+            if mesh_idx % 2 == 0:
+                mesh_lines.append(
+                    (
+                        (float(x), float(fence_y - 0.015), z0 + base_height),
+                        (float(x + post_spacing), float(fence_y - 0.015), z1 + top_height),
+                    )
+                )
+            else:
+                mesh_lines.append(
+                    (
+                        (float(x), float(fence_y - 0.015), z0 + top_height),
+                        (float(x + post_spacing), float(fence_y - 0.015), z1 + base_height),
+                    )
+                )
+    _add_curve_lines(stage, "/World/GP_Props/FenceDiamondMesh", mesh_lines, width=0.012, color=(0.035, 0.045, 0.035))
+
+    _add_concertina_wire(
+        stage,
+        "/World/GP_Props/MainFenceTopConcertina",
+        x_values,
+        y_values,
+        heights,
+        x_min,
+        x_max,
+        fence_y,
+        2.35,
+        0.23,
+        34,
+        0.025,
+        (0.055, 0.065, 0.055),
+    )
+    _add_concertina_wire(
+        stage,
+        "/World/GP_Props/RiverSideGroundConcertina",
+        x_values,
+        y_values,
+        heights,
+        x_min,
+        x_max,
+        fence_y + 1.55,
+        0.35,
+        0.28,
+        32,
+        0.023,
+        (0.055, 0.060, 0.052),
+    )
+    _add_concertina_wire(
+        stage,
+        "/World/GP_Props/InteriorGroundConcertina",
+        x_values,
+        y_values,
+        heights,
+        x_min,
+        x_max,
+        fence_y - 3.15,
+        0.30,
+        0.22,
+        28,
+        0.021,
+        (0.065, 0.060, 0.050),
+    )
+
     for rail_idx, (rail_name, rail_y, rail_height, rail_thickness, rail_color) in enumerate(
         (
             ("Main", fence_y, 1.15, 0.12, (0.06, 0.075, 0.06)),
@@ -560,6 +1141,16 @@ def _add_gp_props(
             rail_color,
         )
 
+    road_center_y = fence_y - 5.0
+    road_z = _sample_height(x_values, y_values, heights, 0.0, road_center_y) + 0.018
+    _add_visual_cube(
+        stage,
+        "/World/GP_Props/PatrolRoadPackedSoil",
+        (0.0, road_center_y, road_z),
+        (x_max - x_min, 2.0, 0.018),
+        (0.18, 0.15, 0.10),
+    )
+
     service_road_lines = []
     for road_offset in (-4.1, -5.7):
         line = []
@@ -570,20 +1161,30 @@ def _add_gp_props(
         service_road_lines.append(line)
     _add_curve_lines(stage, "/World/GP_Props/FenceServiceRoadEdges", service_road_lines, width=0.12, color=(0.22, 0.18, 0.11))
 
-    for tower_idx, tower_x in enumerate((-terrain_size * 0.30, terrain_size * 0.30)):
-        tower_y = fence_y - 4.8
-        tower_z = _sample_height(x_values, y_values, heights, tower_x, tower_y)
-        for leg_idx, (dx, dy) in enumerate(((-0.8, -0.8), (0.8, -0.8), (-0.8, 0.8), (0.8, 0.8))):
-            _add_cube(
+    if not skip_watchtowers:
+        for tower_idx, tower_x in enumerate((-terrain_size * 0.30, terrain_size * 0.30)):
+            tower_y = fence_y - 4.8
+            tower_z = _sample_height(x_values, y_values, heights, tower_x, tower_y)
+            for leg_idx, (dx, dy) in enumerate(((-0.8, -0.8), (0.8, -0.8), (-0.8, 0.8), (0.8, 0.8))):
+                _add_cube(
+                    stage,
+                    f"/World/GP_Props/Watchtower_{tower_idx}_Leg_{leg_idx}",
+                    (tower_x + dx, tower_y + dy, tower_z + 1.75),
+                    (0.12, 0.12, 3.5),
+                    (0.16, 0.12, 0.08),
+                )
+            _add_cube(stage, f"/World/GP_Props/Watchtower_{tower_idx}_Platform", (tower_x, tower_y, tower_z + 3.35), (2.25, 2.25, 0.18), (0.18, 0.15, 0.10))
+            _add_cube(stage, f"/World/GP_Props/Watchtower_{tower_idx}_Cabin", (tower_x, tower_y, tower_z + 4.1), (1.75, 1.55, 1.15), (0.25, 0.29, 0.19))
+            _add_cube(stage, f"/World/GP_Props/Watchtower_{tower_idx}_Roof", (tower_x, tower_y, tower_z + 4.78), (2.25, 1.95, 0.18), (0.09, 0.10, 0.08))
+            _add_cube(stage, f"/World/GP_Props/Watchtower_{tower_idx}_SearchLightHousing", (tower_x, tower_y + 0.95, tower_z + 4.42), (0.42, 0.22, 0.22), (0.04, 0.045, 0.04))
+            _add_sphere_light(
                 stage,
-                f"/World/GP_Props/Watchtower_{tower_idx}_Leg_{leg_idx}",
-                (tower_x + dx, tower_y + dy, tower_z + 1.75),
-                (0.12, 0.12, 3.5),
-                (0.16, 0.12, 0.08),
+                f"/World/GP_Props/Watchtower_{tower_idx}_SearchLight",
+                (tower_x, tower_y + 1.08, tower_z + 4.42),
+                0.16,
+                2200.0,
+                (1.0, 0.86, 0.60),
             )
-        _add_cube(stage, f"/World/GP_Props/Watchtower_{tower_idx}_Platform", (tower_x, tower_y, tower_z + 3.35), (2.25, 2.25, 0.18), (0.18, 0.15, 0.10))
-        _add_cube(stage, f"/World/GP_Props/Watchtower_{tower_idx}_Cabin", (tower_x, tower_y, tower_z + 4.1), (1.75, 1.55, 1.15), (0.25, 0.29, 0.19))
-        _add_cube(stage, f"/World/GP_Props/Watchtower_{tower_idx}_Roof", (tower_x, tower_y, tower_z + 4.78), (2.25, 1.95, 0.18), (0.09, 0.10, 0.08))
 
     for bunker_idx, bunker_x in enumerate((-terrain_size * 0.16, terrain_size * 0.08, terrain_size * 0.24)):
         bunker_y = fence_y - 7.2 - 1.0 * (bunker_idx % 2)
@@ -604,11 +1205,44 @@ def _add_gp_props(
             rotate_xyz=(0.0, 0.0, 8.0 if idx % 2 == 0 else -8.0),
         )
 
+    for marker_idx, x in enumerate(np.linspace(-terrain_size * 0.40, terrain_size * 0.40, 13)):
+        y = fence_y - 2.0
+        z = _sample_height(x_values, y_values, heights, x, y)
+        color = (0.72, 0.62, 0.12) if marker_idx % 2 == 0 else (0.55, 0.08, 0.06)
+        _add_cylinder(stage, f"/World/GP_Props/BoundaryMarker_{marker_idx}", (float(x), y, z + 0.42), 0.045, 0.84, color)
+
     for sign_idx, sign_x in enumerate(np.linspace(-terrain_size * 0.38, terrain_size * 0.38, 7)):
         sign_y = fence_y - 1.0
         sign_z = _sample_height(x_values, y_values, heights, sign_x, sign_y)
         _add_cylinder(stage, f"/World/GP_Props/WarningSign_{sign_idx}_Post", (sign_x, sign_y, sign_z + 0.65), 0.03, 1.3, (0.08, 0.08, 0.07))
         _add_cube(stage, f"/World/GP_Props/WarningSign_{sign_idx}_Plate", (sign_x, sign_y, sign_z + 1.23), (0.75, 0.05, 0.45), (0.85, 0.72, 0.18))
+        _add_visual_cube(stage, f"/World/GP_Props/WarningSign_{sign_idx}_RedStripe", (sign_x, sign_y - 0.028, sign_z + 1.23), (0.72, 0.018, 0.08), (0.70, 0.08, 0.06))
+
+    river_start_y = fence_y + 5.0
+    for buoy_idx, x in enumerate(np.linspace(-terrain_size * 0.32, terrain_size * 0.32, 8)):
+        y = river_start_y + 3.8 + 0.55 * (buoy_idx % 2)
+        z = _sample_height(x_values, y_values, heights, x, y) + 0.17
+        _add_visual_cylinder(stage, f"/World/GP_Props/RiverMarkerBuoy_{buoy_idx}", (float(x), y, z), 0.13, 0.34, (0.80, 0.22, 0.08))
+
+    for reed_idx, x in enumerate(np.linspace(-terrain_size * 0.43, terrain_size * 0.43, 28)):
+        y = river_start_y - 0.65 + 0.35 * np.sin(reed_idx * 1.7)
+        z = _sample_height(x_values, y_values, heights, x, y)
+        height = 0.38 + 0.18 * ((reed_idx * 37) % 11) / 10.0
+        _add_visual_cube(
+            stage,
+            f"/World/GP_Props/RiverBankReed_{reed_idx}",
+            (float(x), float(y), z + height * 0.5),
+            (0.035, 0.035, height),
+            (0.16, 0.20, 0.08),
+            rotate_xyz=(0.0, 0.0, -9.0 + (reed_idx % 5) * 4.5),
+        )
+
+    for light_idx, x in enumerate(np.linspace(-terrain_size * 0.36, terrain_size * 0.36, 5)):
+        y = fence_y - 6.8
+        z = _sample_height(x_values, y_values, heights, x, y)
+        _add_cylinder(stage, f"/World/GP_Props/PatrolLight_{light_idx}_Pole", (float(x), y, z + 1.7), 0.045, 3.4, (0.08, 0.08, 0.07))
+        _add_cube(stage, f"/World/GP_Props/PatrolLight_{light_idx}_Head", (float(x), y + 0.18, z + 3.45), (0.45, 0.22, 0.18), (0.04, 0.045, 0.04))
+        _add_sphere_light(stage, f"/World/GP_Props/PatrolLight_{light_idx}_Lamp", (float(x), y + 0.28, z + 3.45), 0.10, 1300.0, (1.0, 0.84, 0.55))
 
 
 def _create_noise_terrain(
@@ -623,7 +1257,17 @@ def _create_noise_terrain(
     fence_y: float,
     river_width: float,
     texture_path: str,
+    normal_texture_path: str,
+    roughness_texture_path: str,
+    texture_scale: float,
+    add_ground_detail: bool,
     add_gp_props: bool,
+    add_external_props: bool,
+    guard_tower_asset: str,
+    guard_tower_scale: float,
+    fence_asset: str,
+    fence_asset_scale: float,
+    fence_asset_count: int,
 ) -> float:
     x_values, y_values, heights = _generate_heightfield(size, resolution, amplitude, seed, fence_y)
     samples = heights.shape[0]
@@ -649,8 +1293,8 @@ def _create_noise_terrain(
     mesh.CreateFaceVertexIndicesAttr(indices)
     mesh.CreateSubdivisionSchemeAttr().Set("none")
     mesh.CreateDoubleSidedAttr(True)
-    mesh.CreateDisplayColorAttr([Gf.Vec3f(0.22, 0.29, 0.18)])
-    _add_terrain_uvs(mesh, x_values, y_values)
+    mesh.CreateDisplayColorAttr([Gf.Vec3f(0.17, 0.18, 0.12)])
+    _add_terrain_uvs(mesh, x_values, y_values, texture_scale)
     mesh.CreateExtentAttr(
         [
             Gf.Vec3f(float(x_values[0]), float(y_values[0]), float(np.min(heights))),
@@ -671,11 +1315,39 @@ def _create_noise_terrain(
         mesh_collision_api = UsdPhysics.MeshCollisionAPI(terrain_prim)
     mesh_collision_api.CreateApproximationAttr().Set("none")
 
-    _bind_terrain_texture(stage, terrain_prim, texture_path)
+    _bind_terrain_texture(stage, terrain_prim, texture_path, normal_texture_path, roughness_texture_path)
     _add_terrain_grid(stage, x_values, y_values, heights, grid_step)
     _add_river(stage, x_values, y_values, heights, size, fence_y, river_width)
+    if add_ground_detail:
+        _add_ground_surface_variation(stage, x_values, y_values, heights, size, _get_fence_y(size, fence_y))
     if add_gp_props:
-        _add_gp_props(stage, x_values, y_values, heights, size, fence_y, river_width)
+        external_guard_towers_enabled = (
+            add_external_props and bool(guard_tower_asset) and Path(guard_tower_asset).expanduser().exists()
+        )
+        _add_gp_props(
+            stage,
+            x_values,
+            y_values,
+            heights,
+            size,
+            fence_y,
+            river_width,
+            skip_watchtowers=external_guard_towers_enabled,
+        )
+    if add_external_props:
+        _add_external_gp_props(
+            stage,
+            x_values,
+            y_values,
+            heights,
+            size,
+            fence_y,
+            guard_tower_asset,
+            guard_tower_scale,
+            fence_asset,
+            fence_asset_scale,
+            fence_asset_count,
+        )
 
     height_min = float(np.min(heights))
     height_max = float(np.max(heights))
@@ -970,7 +1642,12 @@ def _setup_ros2_static_sensor_tf_graph(
     return {"graph": sensor_tf_graph}
 
 
-def _setup_sentry_sensors(stage, robot_path: str = "/World/Anymal", lidar_mount: str = "robot") -> dict:
+def _setup_sentry_sensors(
+    stage,
+    robot_path: str = "/World/Anymal",
+    lidar_mount: str = "robot",
+    enable_lidar: bool = True,
+) -> dict:
     mount_path = _find_anymal_sensor_mount(stage, robot_path)
     camera_path = _make_child_path(mount_path, FRONT_CAMERA_NAME)
     _add_sensor_visual_markers(stage, mount_path)
@@ -988,14 +1665,19 @@ def _setup_sentry_sensors(stage, robot_path: str = "/World/Anymal", lidar_mount:
         lidar_path = _make_child_path(mount_path, LIDAR_NAME)
         lidar_translation = (0.18, 0.0, 1.05)
 
-    lidar_handles = _create_lidar_and_ros2_writer(lidar_path, translation=lidar_translation)
-    tf_clock_targets = [lidar_path] if lidar_mount == "world" else []
+    if enable_lidar:
+        lidar_handles = _create_lidar_and_ros2_writer(lidar_path, translation=lidar_translation)
+        tf_clock_targets = [lidar_path] if lidar_mount == "world" else []
+    else:
+        lidar_handles = {}
+        tf_clock_targets = []
+        print("ROS 2 LiDAR disabled: camera, TF, and clock publishers remain enabled.")
     tf_clock_graph = _setup_ros2_tf_clock_graph(tf_clock_targets)
     simulation_app.update()
-    print(
-        "ROS 2 sensors enabled: /camera/image_raw, /camera/depth, "
-        "/camera/camera_info, /lidar/points, /tf, /clock"
-    )
+    sensor_topics = "/camera/image_raw, /camera/depth, /camera/camera_info, /tf, /clock"
+    if enable_lidar:
+        sensor_topics += ", /lidar/points"
+    print(f"ROS 2 sensors enabled: {sensor_topics}")
     print(f"Sentry sensors mounted on: {mount_path}")
     return {
         "mount_path": mount_path,
@@ -1095,9 +1777,20 @@ class Anymal_runner(object):
         fence_y,
         river_width,
         terrain_texture,
+        terrain_normal_texture,
+        terrain_roughness_texture,
+        terrain_texture_scale,
+        add_ground_detail,
         add_gp_props,
+        add_external_props,
+        guard_tower_asset,
+        guard_tower_scale,
+        fence_asset,
+        fence_asset_scale,
+        fence_asset_count,
         terrain_seed,
         enable_ros2_sensors,
+        enable_ros2_lidar,
         enable_ros2_cmd_vel,
         enable_ros2_odom,
         cmd_vel_topic,
@@ -1109,6 +1802,9 @@ class Anymal_runner(object):
         intruder_count,
         intruder_speed,
         intruder_seed,
+        intruder_visual,
+        intruder_human_usd,
+        intruder_yaw_deg,
     ) -> None:
         """
         Creates the simulation world and places ANYmal on a generated GP-style noise terrain.
@@ -1134,8 +1830,23 @@ class Anymal_runner(object):
             fence_y=fence_y,
             river_width=river_width,
             texture_path=terrain_texture,
+            normal_texture_path=terrain_normal_texture,
+            roughness_texture_path=terrain_roughness_texture,
+            texture_scale=terrain_texture_scale,
+            add_ground_detail=add_ground_detail,
             add_gp_props=add_gp_props,
+            add_external_props=add_external_props,
+            guard_tower_asset=guard_tower_asset,
+            guard_tower_scale=guard_tower_scale,
+            fence_asset=fence_asset,
+            fence_asset_scale=fence_asset_scale,
+            fence_asset_count=fence_asset_count,
         )
+        self._terrain_size = float(terrain_size)
+        self._fence_y = _get_fence_y(terrain_size, fence_y)
+        self._terrain_x_values = terrain_x_values
+        self._terrain_y_values = terrain_y_values
+        self._terrain_heights = terrain_heights
         self._intruder_scenario = (
             IntruderScenario(
                 self._stage,
@@ -1148,6 +1859,9 @@ class Anymal_runner(object):
                 count=intruder_count,
                 speed=intruder_speed,
                 seed=intruder_seed,
+                visual_mode=intruder_visual,
+                human_usd_path=intruder_human_usd,
+                yaw_deg=intruder_yaw_deg,
             )
             if enable_intruder
             else None
@@ -1160,7 +1874,9 @@ class Anymal_runner(object):
         )
         simulation_app.update()
         self._ros_sensor_handles = (
-            _setup_sentry_sensors(self._stage, lidar_mount=lidar_mount) if enable_ros2_sensors else {}
+            _setup_sentry_sensors(self._stage, lidar_mount=lidar_mount, enable_lidar=enable_ros2_lidar)
+            if enable_ros2_sensors
+            else {}
         )
         self._chassis_prim_path = self._ros_sensor_handles.get("mount_path") or _find_anymal_sensor_mount(self._stage)
         self._chassis_frame_id = self._chassis_prim_path.rsplit("/", 1)[-1] or "Anymal"
@@ -1315,6 +2031,111 @@ class Anymal_runner(object):
                 self._intruder_scenario.update(step_size)
             self._update_lidar_follow_pose()
 
+    def generate_replicator_dataset(
+        self,
+        output_dir: str,
+        frame_count: int,
+        image_width: int,
+        image_height: int,
+        seed: int,
+        profile: str = "fence",
+    ) -> None:
+        if self._intruder_scenario is None:
+            carb.log_warn("Replicator dataset requested, but intruder scenario is disabled.")
+            return
+
+        output_path = Path(output_dir).expanduser()
+        output_path.mkdir(parents=True, exist_ok=True)
+        rng = np.random.default_rng(seed)
+        profile = profile if profile in ("fence", "clear", "hard", "mixed", "calibration") else "fence"
+
+        camera = rep.create.camera()
+        render_product = rep.create.render_product(camera, resolution=(int(image_width), int(image_height)))
+        writer = rep.WriterRegistry.get("BasicWriter")
+        writer.initialize(
+            output_dir=str(output_path),
+            rgb=True,
+            bounding_box_2d_tight=True,
+        )
+        writer.attach([render_product])
+
+        frame_count = max(1, int(frame_count))
+        if profile == "calibration":
+            clear_count = int(round(frame_count * 0.40))
+            fence_count = int(round(frame_count * 0.40))
+            hard_count = max(0, frame_count - clear_count - fence_count)
+            frame_profiles = ["clear"] * clear_count + ["fence"] * fence_count + ["hard"] * hard_count
+            rng.shuffle(frame_profiles)
+        elif profile == "mixed":
+            frame_profiles = list(rng.choice(("clear", "fence", "hard"), size=frame_count, p=(0.40, 0.40, 0.20)))
+        else:
+            frame_profiles = [profile] * frame_count
+
+        profile_counts = {name: frame_profiles.count(name) for name in ("clear", "fence", "hard")}
+        print(
+            "Replicator person preview dataset: "
+            f"frames={frame_count}, profile={profile}, "
+            f"clear={profile_counts['clear']}, fence={profile_counts['fence']}, hard={profile_counts['hard']}, "
+            f"output={output_path}, resolution={int(image_width)}x{int(image_height)}"
+        )
+
+        for frame_idx in range(frame_count):
+            frame_profile = frame_profiles[frame_idx]
+            intruder_positions = self._intruder_scenario.randomize_for_dataset()
+            if intruder_positions:
+                target_xy = intruder_positions[int(rng.integers(0, len(intruder_positions)))]
+                target = (
+                    float(target_xy[0]),
+                    float(target_xy[1]),
+                    float(_sample_height(self._terrain_x_values, self._terrain_y_values, self._terrain_heights, target_xy[0], target_xy[1]) + 1.0),
+                )
+            else:
+                target = (0.0, self._fence_y + 2.0, 1.0)
+
+            if frame_profile == "clear":
+                camera_x = target[0] + rng.uniform(-6.0, 6.0)
+                camera_y = self._fence_y + rng.uniform(3.0, 8.0)
+                camera_z = rng.uniform(0.75, 1.35)
+                look_at_jitter = (0.85, 0.55, 0.30)
+            elif frame_profile == "hard":
+                camera_x = target[0] + rng.uniform(-18.0, 18.0)
+                camera_y = self._fence_y - rng.uniform(12.0, 24.0)
+                camera_z = rng.uniform(0.52, 1.42)
+                look_at_jitter = (2.2, 1.4, 0.55)
+            else:
+                camera_x = target[0] + rng.uniform(-10.0, 10.0)
+                camera_y = self._fence_y - rng.uniform(5.0, 14.0)
+                camera_z = rng.uniform(0.62, 1.18)
+                look_at_jitter = (1.5, 0.8, 0.45)
+
+            camera_x = float(np.clip(camera_x, -self._terrain_size * 0.38, self._terrain_size * 0.38))
+            camera_y = float(np.clip(camera_y, -self._terrain_size * 0.46, self._terrain_size * 0.46))
+            camera_z = float(camera_z)
+            look_at = (
+                target[0] + float(rng.uniform(-look_at_jitter[0], look_at_jitter[0])),
+                target[1] + float(rng.uniform(-look_at_jitter[1], look_at_jitter[1])),
+                target[2] + float(rng.uniform(-0.25, look_at_jitter[2])),
+            )
+
+            with camera:
+                rep.modify.pose(position=(camera_x, camera_y, camera_z), look_at=look_at)
+
+            simulation_app.update()
+            try:
+                rep.orchestrator.step(rt_subframes=4)
+            except TypeError:
+                rep.orchestrator.step()
+            simulation_app.update()
+
+            if (frame_idx + 1) % 10 == 0 or frame_idx == frame_count - 1:
+                print(f"Captured Replicator frame {frame_idx + 1}/{frame_count} ({frame_profile})")
+
+        try:
+            rep.orchestrator.wait_until_complete()
+        except Exception:
+            pass
+        print(f"Replicator preview dataset written to: {output_path}")
+
     def run(self) -> None:
         """
         Step simulation based on rendering downtime
@@ -1363,8 +2184,12 @@ def main():
         f"trail_width={args.trail_width:.1f}m, "
         f"fence_y={args.fence_y:.1f}m, "
         f"river_width={args.river_width:.1f}m, "
+        f"texture_scale={args.terrain_texture_scale:.2f}, "
+        f"ground_detail={not args.no_ground_detail}, "
         f"gp_props={not args.no_gp_props}, "
+        f"external_props={not args.no_external_props}, "
         f"ros2_sensors={not args.no_ros2_sensors}, "
+        f"ros2_lidar={not args.no_ros2_lidar}, "
         f"ros2_cmd_vel={not args.no_ros2_cmd_vel}, "
         f"ros2_odom={not args.no_ros2_odom}, "
         f"cmd_vel_topic=/{args.cmd_vel_topic.lstrip('/')}, "
@@ -1372,10 +2197,23 @@ def main():
         f"intruder={not args.no_intruder}, "
         f"intruder_count={args.intruder_count}, "
         f"intruder_speed={args.intruder_speed:.2f}m/s, "
+        f"intruder_visual={args.intruder_visual}, "
+        f"intruder_yaw={args.intruder_yaw_deg:.1f}deg, "
+        f"replicator_dataset={args.replicator_dataset}, "
         f"seed={args.terrain_seed}"
     )
     if args.terrain_texture:
         print(f"Terrain texture: {args.terrain_texture}")
+    if args.terrain_normal_texture:
+        print(f"Terrain normal texture: {args.terrain_normal_texture}")
+    if args.terrain_roughness_texture:
+        print(f"Terrain roughness texture: {args.terrain_roughness_texture}")
+    if not args.no_external_props:
+        print(f"Guard tower asset: {args.guard_tower_asset} scale={args.guard_tower_scale:.3f}")
+        print(
+            f"Fence asset: {args.fence_asset} "
+            f"scale={args.fence_asset_scale:.3f}, count={args.fence_asset_count}"
+        )
     print("Control: ROS 2 /cmd_vel has priority; keyboard arrows/N/M remain as fallback.")
 
     runner = Anymal_runner(
@@ -1389,9 +2227,20 @@ def main():
         fence_y=args.fence_y,
         river_width=args.river_width,
         terrain_texture=args.terrain_texture,
+        terrain_normal_texture=args.terrain_normal_texture,
+        terrain_roughness_texture=args.terrain_roughness_texture,
+        terrain_texture_scale=args.terrain_texture_scale,
+        add_ground_detail=not args.no_ground_detail,
         add_gp_props=not args.no_gp_props,
+        add_external_props=not args.no_external_props,
+        guard_tower_asset=args.guard_tower_asset,
+        guard_tower_scale=args.guard_tower_scale,
+        fence_asset=args.fence_asset,
+        fence_asset_scale=args.fence_asset_scale,
+        fence_asset_count=args.fence_asset_count,
         terrain_seed=args.terrain_seed,
         enable_ros2_sensors=not args.no_ros2_sensors,
+        enable_ros2_lidar=not args.no_ros2_lidar,
         enable_ros2_cmd_vel=not args.no_ros2_cmd_vel,
         enable_ros2_odom=not args.no_ros2_odom,
         cmd_vel_topic=args.cmd_vel_topic,
@@ -1403,14 +2252,27 @@ def main():
         intruder_count=args.intruder_count,
         intruder_speed=args.intruder_speed,
         intruder_seed=args.intruder_seed,
+        intruder_visual=args.intruder_visual,
+        intruder_human_usd=args.intruder_human_usd,
+        intruder_yaw_deg=args.intruder_yaw_deg,
     )
     simulation_app.update()
     runner._world.reset()
     simulation_app.update()
-    runner.setup()
-    simulation_app.update()
     try:
-        runner.run()
+        if args.replicator_dataset:
+            runner.generate_replicator_dataset(
+                output_dir=args.dataset_output_dir,
+                frame_count=args.dataset_frames,
+                image_width=args.dataset_width,
+                image_height=args.dataset_height,
+                seed=args.dataset_seed,
+                profile=args.dataset_profile,
+            )
+        else:
+            runner.setup()
+            simulation_app.update()
+            runner.run()
     finally:
         runner.shutdown()
         simulation_app.close()

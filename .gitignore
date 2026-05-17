@@ -9,6 +9,9 @@ ros2_ws/log/
 
 media/recordings/
 assets/raw/
+datasets/
+runs/
+models/
 *.bag/
 *.db3
 

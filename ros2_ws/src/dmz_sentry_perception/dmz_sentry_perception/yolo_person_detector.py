@@ -17,20 +17,28 @@ class YoloPersonDetector(Node):
         self.declare_parameter("image_topic", "/camera/image_raw")
         self.declare_parameter("annotated_topic", "/camera/annotated")
         self.declare_parameter("detections_topic", "/detections_text")
+        self.declare_parameter("alerts_topic", "/alerts")
         self.declare_parameter("model", "yolov8n.pt")
         self.declare_parameter("confidence", 0.35)
         self.declare_parameter("image_size", 640)
         self.declare_parameter("every_n", 2)
         self.declare_parameter("device", "")
+        self.declare_parameter("publish_annotated", False)
+        self.declare_parameter("alert_confidence", 0.20)
+        self.declare_parameter("alert_cooldown", 1.0)
 
         self._image_topic = self.get_parameter("image_topic").get_parameter_value().string_value
         self._annotated_topic = self.get_parameter("annotated_topic").get_parameter_value().string_value
         self._detections_topic = self.get_parameter("detections_topic").get_parameter_value().string_value
+        self._alerts_topic = self.get_parameter("alerts_topic").get_parameter_value().string_value
         self._model_name = self.get_parameter("model").get_parameter_value().string_value
         self._confidence = float(self.get_parameter("confidence").value)
         self._image_size = int(self.get_parameter("image_size").value)
         self._every_n = max(1, int(self.get_parameter("every_n").value))
         self._device = self.get_parameter("device").get_parameter_value().string_value.strip()
+        self._publish_annotated = bool(self.get_parameter("publish_annotated").value)
+        self._alert_confidence = float(self.get_parameter("alert_confidence").value)
+        self._alert_cooldown = max(0.0, float(self.get_parameter("alert_cooldown").value))
 
         try:
             from ultralytics import YOLO
@@ -43,9 +51,13 @@ class YoloPersonDetector(Node):
         self._model = YOLO(self._model_name)
         self._frame_count = 0
         self._last_log_time = 0.0
+        self._last_alert_time = 0.0
 
-        self._annotated_pub = self.create_publisher(Image, self._annotated_topic, 5)
+        self._annotated_pub = (
+            self.create_publisher(Image, self._annotated_topic, 2) if self._publish_annotated else None
+        )
         self._detections_pub = self.create_publisher(String, self._detections_topic, 10)
+        self._alerts_pub = self.create_publisher(String, self._alerts_topic, 10)
         self._image_sub = self.create_subscription(
             Image,
             self._image_topic,
@@ -55,8 +67,8 @@ class YoloPersonDetector(Node):
 
         self.get_logger().info(
             "YOLO person detector ready: "
-            f"image={self._image_topic}, annotated={self._annotated_topic}, "
-            f"detections={self._detections_topic}, model={self._model_name}"
+            f"image={self._image_topic}, detections={self._detections_topic}, "
+            f"alerts={self._alerts_topic}, annotated={self._publish_annotated}, model={self._model_name}"
         )
 
     def _to_bgr(self, msg: Image):
@@ -119,7 +131,6 @@ class YoloPersonDetector(Node):
 
         results = self._model.predict(**predict_kwargs)
         result = results[0]
-        annotated = result.plot()
 
         detections = []
         if result.boxes is not None:
@@ -136,8 +147,10 @@ class YoloPersonDetector(Node):
                     }
                 )
 
-        annotated_msg = self._to_image_msg(annotated, msg.header)
-        self._annotated_pub.publish(annotated_msg)
+        if self._annotated_pub is not None:
+            annotated = result.plot()
+            annotated_msg = self._to_image_msg(annotated, msg.header)
+            self._annotated_pub.publish(annotated_msg)
 
         text_msg = String()
         text_msg.data = json.dumps(
@@ -150,6 +163,28 @@ class YoloPersonDetector(Node):
         self._detections_pub.publish(text_msg)
 
         now = time.monotonic()
+        alert_candidates = [item for item in detections if item["confidence"] >= self._alert_confidence]
+        if alert_candidates and now - self._last_alert_time > self._alert_cooldown:
+            best = max(alert_candidates, key=lambda item: item["confidence"])
+            alert_msg = String()
+            alert_msg.data = json.dumps(
+                {
+                    "level": "ALERT",
+                    "event": "person_detected_near_fence",
+                    "frame_id": msg.header.frame_id,
+                    "confidence": best["confidence"],
+                    "bbox_xyxy": best["xyxy"],
+                    "count": len(alert_candidates),
+                    "action": "report_and_track",
+                }
+            )
+            self._alerts_pub.publish(alert_msg)
+            self.get_logger().warn(
+                "[ALERT] person detected near fence: "
+                f"count={len(alert_candidates)}, best_conf={best['confidence']:.2f}"
+            )
+            self._last_alert_time = now
+
         if detections and now - self._last_log_time > 1.0:
             best = max(detections, key=lambda item: item["confidence"])
             self.get_logger().info(
