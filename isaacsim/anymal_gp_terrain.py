@@ -270,6 +270,8 @@ class _OptionalRosStringPublisher:
         msg = self._string_type()
         msg.data = data
         self._publisher.publish(msg)
+        if self._rclpy is not None and self._node is not None:
+            self._rclpy.spin_once(self._node, timeout_sec=0.0)
 
     def shutdown(self) -> None:
         if self._node is not None:

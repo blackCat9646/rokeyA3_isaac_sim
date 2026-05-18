@@ -17,10 +17,13 @@ const eventLog = document.getElementById("eventLog");
 const state = {
   connected: false,
   robot: { x: 0, y: 0, yaw: 0 },
+  home: { x: 0, y: 0 },
   waypoint: null,
   mode: "IDLE",
   trail: [],
+  route: [],
   intruders: [],
+  lastIntruderStateTime: 0,
   lastAlert: null,
   lastAlertTime: 0,
 };
@@ -162,6 +165,7 @@ function handleIntruderStates(msg) {
   try {
     const payload = JSON.parse(msg.data);
     state.intruders = Array.isArray(payload.intruders) ? payload.intruders : [];
+    state.lastIntruderStateTime = Date.now();
   } catch (error) {
     logEvent("failed to parse intruder states");
   }
@@ -172,6 +176,8 @@ function handlePatrolState(msg) {
     const payload = JSON.parse(msg.data);
     state.mode = payload.mode || state.mode;
     state.waypoint = payload.waypoint || payload.target || state.waypoint;
+    state.home = payload.home || state.home;
+    state.route = Array.isArray(payload.route) ? payload.route : [];
     if (payload.pose) {
       state.robot.x = payload.pose.x;
       state.robot.y = payload.pose.y;
@@ -279,7 +285,9 @@ function drawMap() {
   drawWorldLine([{ x: WORLD_MIN, y: 16 }, { x: WORLD_MAX, y: 16 }], "rgba(230, 198, 75, 0.88)", 3);
   drawWorldLine([{ x: WORLD_MIN + 5, y: 10 }, { x: WORLD_MAX - 5, y: 10 }], "rgba(140, 105, 52, 0.88)", 4, [10, 7]);
   drawWorldLine([{ x: -22, y: 12 }, { x: 22, y: 12 }], "rgba(54, 244, 154, 0.72)", 2);
+  drawWorldLine([{ x: state.home.x, y: state.home.y }, { x: state.home.x, y: 12 }], "rgba(58, 216, 255, 0.35)", 2, [5, 8]);
 
+  drawMarker(state.home.x, state.home.y, "HOME", "rgba(58, 216, 255, 0.95)");
   drawMarker(-24.8, 10, "Tower W", "rgba(230, 198, 75, 0.95)");
   drawMarker(24.8, 10, "Tower E", "rgba(230, 198, 75, 0.95)");
   drawMarker(-12.8, 8.8, "Bunker", "rgba(150, 180, 150, 0.95)");
@@ -291,6 +299,9 @@ function drawMap() {
 
   if (state.waypoint) {
     drawMarker(state.waypoint.x, state.waypoint.y, "Patrol WP", "rgba(255, 141, 58, 0.95)");
+  }
+  if (state.route.length > 0 && state.waypoint) {
+    drawWorldLine([state.waypoint, ...state.route], "rgba(255, 141, 58, 0.55)", 2, [7, 7]);
   }
 
   state.intruders.forEach(drawIntruderMarker);
@@ -338,9 +349,14 @@ function updateText() {
       : "";
     alertText.textContent = `${state.lastAlert}${intruderSummary}`;
   } else {
-    alertText.textContent = state.intruders.length
-      ? `${state.intruders.length} intruder position(s) tracked`
-      : "No active alert";
+    const intruderFresh = Date.now() - state.lastIntruderStateTime < 3000;
+    if (intruderFresh && state.intruders.length) {
+      alertText.textContent = `${state.intruders.length} intruder position(s) tracked`;
+    } else if (!intruderFresh) {
+      alertText.textContent = "No intruder telemetry";
+    } else {
+      alertText.textContent = "No active alert";
+    }
   }
 }
 
@@ -351,6 +367,7 @@ function animate() {
 }
 
 document.getElementById("launchBtn").addEventListener("click", () => publishMission("start_patrol"));
+document.getElementById("homeBtn").addEventListener("click", () => publishMission("go_home"));
 document.getElementById("stopBtn").addEventListener("click", () => publishMission("stop"));
 document.getElementById("resumeBtn").addEventListener("click", () => publishMission("resume"));
 window.addEventListener("resize", resizeCanvas);

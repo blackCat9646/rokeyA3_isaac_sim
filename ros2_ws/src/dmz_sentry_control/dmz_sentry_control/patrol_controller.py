@@ -13,6 +13,7 @@ from std_msgs.msg import String
 class PatrolMode(str, Enum):
     IDLE = "IDLE"
     PATROL = "PATROL"
+    HOME = "HOME"
     ALERT_STOP = "ALERT_STOP"
     STOPPED = "STOPPED"
 
@@ -40,6 +41,8 @@ class PatrolController(Node):
         self.declare_parameter("patrol_y", 12.0)
         self.declare_parameter("patrol_x_min", -22.0)
         self.declare_parameter("patrol_x_max", 22.0)
+        self.declare_parameter("home_x", 0.0)
+        self.declare_parameter("home_y", 0.0)
         self.declare_parameter("waypoint_tolerance", 1.5)
         self.declare_parameter("max_linear_command", 1.0)
         self.declare_parameter("max_yaw_command", 1.0)
@@ -58,6 +61,10 @@ class PatrolController(Node):
         self._patrol_y = float(self.get_parameter("patrol_y").value)
         self._patrol_x_min = float(self.get_parameter("patrol_x_min").value)
         self._patrol_x_max = float(self.get_parameter("patrol_x_max").value)
+        self._home = (
+            float(self.get_parameter("home_x").value),
+            float(self.get_parameter("home_y").value),
+        )
         self._waypoint_tolerance = max(0.1, float(self.get_parameter("waypoint_tolerance").value))
         self._max_linear_command = max(0.05, float(self.get_parameter("max_linear_command").value))
         self._max_yaw_command = max(0.05, float(self.get_parameter("max_yaw_command").value))
@@ -73,7 +80,9 @@ class PatrolController(Node):
             (self._patrol_x_min, self._patrol_y),
             (self._patrol_x_max, self._patrol_y),
         )
-        self._waypoint = self._patrol_waypoints[0]
+        self._lane_entry = (self._home[0], self._patrol_y)
+        self._waypoint = self._home
+        self._route_queue = []
         self._next_waypoint_index = 1
         self._last_alert_time = 0.0
 
@@ -99,10 +108,17 @@ class PatrolController(Node):
         command = msg.data.strip().lower()
         if command in ("start", "start_patrol", "launch", "sortie"):
             self._mode = PatrolMode.PATROL
-            self._select_initial_patrol_waypoint()
+            self._set_patrol_route_from_current_pose()
             self._resume_mode = PatrolMode.PATROL
             self.get_logger().info(
                 f"Mission command: start tower patrol toward x={self._waypoint[0]:.1f}, y={self._waypoint[1]:.1f}"
+            )
+        elif command in ("home", "go_home", "return_home", "rtb"):
+            self._mode = PatrolMode.HOME
+            self._set_home_route_from_current_pose()
+            self._resume_mode = PatrolMode.HOME
+            self.get_logger().info(
+                f"Mission command: return home toward x={self._waypoint[0]:.1f}, y={self._waypoint[1]:.1f}"
             )
         elif command in ("stop", "halt"):
             self._mode = PatrolMode.STOPPED
@@ -138,10 +154,51 @@ class PatrolController(Node):
             self._waypoint = self._patrol_waypoints[1]
             self._next_waypoint_index = 0
 
+    def _set_route(self, waypoints: list[tuple[float, float]]) -> None:
+        if not waypoints:
+            waypoints = [self._home]
+        self._waypoint = waypoints[0]
+        self._route_queue = list(waypoints[1:])
+
+    def _set_patrol_route_from_current_pose(self) -> None:
+        self._select_initial_patrol_waypoint()
+        patrol_target = self._waypoint
+        route = []
+        if self._pose is None or abs(self._pose[1] - self._patrol_y) > self._waypoint_tolerance:
+            route.append(self._lane_entry)
+        route.append(patrol_target)
+        self._set_route(route)
+
+    def _set_home_route_from_current_pose(self) -> None:
+        route = []
+        if self._pose is None or abs(self._pose[0] - self._home[0]) > 3.0 or self._pose[1] > self._home[1] + 3.0:
+            route.append(self._lane_entry)
+        route.append(self._home)
+        self._set_route(route)
+
     def _next_patrol_waypoint(self) -> tuple[float, float]:
         waypoint = self._patrol_waypoints[self._next_waypoint_index % len(self._patrol_waypoints)]
         self._next_waypoint_index += 1
         return waypoint
+
+    def _advance_waypoint_after_arrival(self) -> None:
+        if self._route_queue:
+            self._waypoint = self._route_queue.pop(0)
+            self.get_logger().info(
+                f"Advancing route waypoint to x={self._waypoint[0]:.1f}, y={self._waypoint[1]:.1f}"
+            )
+            return
+
+        if self._mode == PatrolMode.HOME:
+            self._mode = PatrolMode.IDLE
+            self._waypoint = self._home
+            self.get_logger().info("Home reached; switching to IDLE")
+            return
+
+        self._waypoint = self._next_patrol_waypoint()
+        self.get_logger().info(
+            f"Switching patrol waypoint to x={self._waypoint[0]:.1f}, y={self._waypoint[1]:.1f}"
+        )
 
     def _distance_to_waypoint(self) -> float | None:
         if self._pose is None:
@@ -165,7 +222,6 @@ class PatrolController(Node):
         cos_yaw = math.cos(yaw)
         sin_yaw = math.sin(yaw)
         dx_body = cos_yaw * dx_world + sin_yaw * dy_world
-        dy_body = -sin_yaw * dx_world + cos_yaw * dy_world
 
         desired_yaw = math.atan2(dy_world, dx_world)
         yaw_error = _wrap_angle(desired_yaw - yaw)
@@ -178,9 +234,7 @@ class PatrolController(Node):
         msg.linear.x = float(
             max(-self._max_linear_command, min(self._max_linear_command, dx_body * self._position_gain))
         )
-        msg.linear.y = float(
-            max(-self._max_linear_command, min(self._max_linear_command, dy_body * self._position_gain))
-        )
+        msg.linear.y = 0.0
         return msg
 
     def _publish_stop(self) -> None:
@@ -199,11 +253,11 @@ class PatrolController(Node):
         else:
             distance = self._distance_to_waypoint()
             if distance is not None and distance <= self._waypoint_tolerance:
-                self._waypoint = self._next_patrol_waypoint()
-                self.get_logger().info(
-                    f"Switching patrol waypoint to x={self._waypoint[0]:.1f}, y={self._waypoint[1]:.1f}"
-                )
-            self._cmd_pub.publish(self._make_tracking_command())
+                self._advance_waypoint_after_arrival()
+            if self._mode in (PatrolMode.IDLE, PatrolMode.STOPPED):
+                self._publish_stop()
+            else:
+                self._cmd_pub.publish(self._make_tracking_command())
 
         self._publish_state()
 
@@ -211,6 +265,8 @@ class PatrolController(Node):
         payload = {
             "mode": self._mode.value,
             "waypoint": {"x": self._waypoint[0], "y": self._waypoint[1]},
+            "home": {"x": self._home[0], "y": self._home[1]},
+            "route": [{"x": waypoint[0], "y": waypoint[1]} for waypoint in self._route_queue],
             "pose": None,
         }
         if self._pose is not None:
