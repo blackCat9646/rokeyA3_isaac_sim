@@ -76,6 +76,77 @@ YOLO_CONFIDENCE=0.35 ./scripts/demo_yolo_detector.sh
 YOLO_ANNOTATED_SCALE=1.0 ./scripts/demo_yolo_detector.sh
 ```
 
+## Tactical Map and Patrol
+
+The tactical map is a lightweight web view for the DMZ simulation coordinate frame. It draws the fence line, river band, patrol lane, towers, robot marker, current patrol target, and YOLO alert state. The web buttons publish high-level mission commands only; the ROS 2 patrol controller owns `/cmd_vel`.
+
+Build the ROS 2 workspace after pulling or changing control nodes:
+
+```bash
+cd /home/rokey/dev_ws/dmz_sentry/ros2_ws
+source /opt/ros/humble/setup.bash
+colcon build --symlink-install
+```
+
+Install rosbridge if it is not already available:
+
+```bash
+sudo apt install ros-humble-rosbridge-suite
+```
+
+Run the full tactical demo:
+
+```bash
+# Terminal 1: Isaac Sim
+cd /home/rokey/dev_ws/dmz_sentry
+./scripts/demo_dmz_sim.sh
+
+# Terminal 2: YOLO detector
+cd /home/rokey/dev_ws/dmz_sentry
+./scripts/demo_yolo_detector.sh
+
+# Terminal 3: waypoint patrol controller
+cd /home/rokey/dev_ws/dmz_sentry
+./scripts/demo_patrol_controller.sh
+
+# Terminal 4: ROS bridge websocket
+cd /home/rokey/dev_ws/dmz_sentry
+./scripts/demo_rosbridge.sh
+
+# Terminal 5: static tactical web map
+cd /home/rokey/dev_ws/dmz_sentry
+./scripts/demo_tactical_map.sh
+```
+
+Open:
+
+```text
+http://localhost:8080
+```
+
+The web controls publish:
+
+- `start_patrol` on `/mission_command`: move to the staging point near the fence and start left/right patrol
+- `stop` on `/mission_command`: stop and hold position
+- `resume` on `/mission_command`: resume the previous patrol mode
+
+Patrol topics:
+
+- `/mission_command` (`std_msgs/String`): high-level command from web or terminal
+- `/patrol_state` (`std_msgs/String` JSON): controller state for the web UI
+- `/cmd_vel` (`geometry_msgs/Twist`): velocity command sent to ANYmal
+- `/alerts` (`std_msgs/String` JSON): YOLO person alert, used to stop patrol temporarily
+
+Manual command test without the web UI:
+
+```bash
+source /opt/ros/humble/setup.bash
+source /home/rokey/dev_ws/dmz_sentry/ros2_ws/install/setup.bash
+export ROS_DOMAIN_ID=129
+ros2 topic pub --once /mission_command std_msgs/msg/String "{data: start_patrol}"
+ros2 topic echo /patrol_state
+```
+
 ## ROS 2 Teleoperation
 
 Start Isaac Sim:
@@ -244,6 +315,7 @@ dmz_sentry/
   isaacsim/          Isaac Sim standalone scripts
   scripts/           Run/check helper scripts
   ros2_ws/src/       Future ROS 2 packages
+  web/tactical_map/  Browser tactical map for odom, patrol state, and alerts
   assets/textures/   Satellite/orthophoto terrain textures
   docs/              Notes and diagrams
   media/             Screenshots and demo captures

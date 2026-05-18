@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>DMZ Sentry Tactical Map</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="map-panel">
+        <div class="topbar">
+          <div>
+            <h1>DMZ SENTRY</h1>
+            <p>Tactical patrol map</p>
+          </div>
+          <div id="connectionBadge" class="badge offline">ROSBRIDGE OFFLINE</div>
+        </div>
+        <canvas id="mapCanvas" width="980" height="760" aria-label="DMZ tactical map"></canvas>
+      </section>
+
+      <aside class="side-panel">
+        <section class="block">
+          <h2>Mission</h2>
+          <div class="button-row">
+            <button id="launchBtn">출격</button>
+            <button id="stopBtn" class="secondary">정지</button>
+            <button id="resumeBtn" class="secondary">재개</button>
+          </div>
+        </section>
+
+        <section class="block">
+          <h2>Status</h2>
+          <dl class="status-grid">
+            <dt>Mode</dt>
+            <dd id="modeText">IDLE</dd>
+            <dt>Position</dt>
+            <dd id="positionText">x 0.00 / y 0.00</dd>
+            <dt>Yaw</dt>
+            <dd id="yawText">0.0 deg</dd>
+            <dt>Target</dt>
+            <dd id="targetText">none</dd>
+          </dl>
+        </section>
+
+        <section class="block alert-block" id="alertBlock">
+          <h2>Alert</h2>
+          <div id="alertText" class="alert-text">No active alert</div>
+        </section>
+
+        <section class="block">
+          <h2>Event Log</h2>
+          <ol id="eventLog" class="event-log"></ol>
+        </section>
+      </aside>
+    </main>
+
+    <script src="./app.js"></script>
+  </body>
+</html>
