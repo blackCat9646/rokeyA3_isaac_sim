@@ -78,7 +78,7 @@ YOLO_ANNOTATED_SCALE=1.0 ./scripts/demo_yolo_detector.sh
 
 ## Tactical Map and Patrol
 
-The tactical map is a lightweight web view for the DMZ simulation coordinate frame. It draws the fence line, river band, patrol lane, towers, robot marker, current patrol target, and YOLO alert state. The web buttons publish high-level mission commands only; the ROS 2 patrol controller owns `/cmd_vel`.
+The tactical map is a lightweight web view for the DMZ simulation coordinate frame. It draws the fence line, river band, safe patrol lane, towers, robot marker, current patrol waypoint, and YOLO alert state. The web buttons publish high-level mission commands only; the ROS 2 patrol controller owns `/cmd_vel`.
 
 Build the ROS 2 workspace after pulling or changing control nodes:
 
@@ -126,7 +126,7 @@ http://localhost:8080
 
 The web controls publish:
 
-- `start_patrol` on `/mission_command`: move to the staging point near the fence and start left/right patrol
+- `start_patrol` on `/mission_command`: patrol on the clear straight lane between Tower W and Tower E
 - `stop` on `/mission_command`: stop and hold position
 - `resume` on `/mission_command`: resume the previous patrol mode
 

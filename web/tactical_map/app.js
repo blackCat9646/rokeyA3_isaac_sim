@@ -9,7 +9,7 @@ const connectionBadge = document.getElementById("connectionBadge");
 const modeText = document.getElementById("modeText");
 const positionText = document.getElementById("positionText");
 const yawText = document.getElementById("yawText");
-const targetText = document.getElementById("targetText");
+const waypointText = document.getElementById("waypointText");
 const alertBlock = document.getElementById("alertBlock");
 const alertText = document.getElementById("alertText");
 const eventLog = document.getElementById("eventLog");
@@ -17,7 +17,7 @@ const eventLog = document.getElementById("eventLog");
 const state = {
   connected: false,
   robot: { x: 0, y: 0, yaw: 0 },
-  target: null,
+  waypoint: null,
   mode: "IDLE",
   trail: [],
   lastAlert: null,
@@ -158,7 +158,7 @@ function handlePatrolState(msg) {
   try {
     const payload = JSON.parse(msg.data);
     state.mode = payload.mode || state.mode;
-    state.target = payload.target || state.target;
+    state.waypoint = payload.waypoint || payload.target || state.waypoint;
     if (payload.pose) {
       state.robot.x = payload.pose.x;
       state.robot.y = payload.pose.y;
@@ -242,7 +242,7 @@ function drawMap() {
   drawWorldRect(WORLD_MIN, 21, WORLD_MAX, WORLD_MAX, "rgba(30, 104, 142, 0.24)", "rgba(58, 216, 255, 0.22)");
   drawWorldLine([{ x: WORLD_MIN, y: 16 }, { x: WORLD_MAX, y: 16 }], "rgba(230, 198, 75, 0.88)", 3);
   drawWorldLine([{ x: WORLD_MIN + 5, y: 10 }, { x: WORLD_MAX - 5, y: 10 }], "rgba(140, 105, 52, 0.88)", 4, [10, 7]);
-  drawWorldLine([{ x: -25, y: 10 }, { x: 25, y: 10 }], "rgba(54, 244, 154, 0.72)", 2);
+  drawWorldLine([{ x: -22, y: 12 }, { x: 22, y: 12 }], "rgba(54, 244, 154, 0.72)", 2);
 
   drawMarker(-24.8, 10, "Tower W", "rgba(230, 198, 75, 0.95)");
   drawMarker(24.8, 10, "Tower E", "rgba(230, 198, 75, 0.95)");
@@ -253,8 +253,8 @@ function drawMap() {
     drawWorldLine(state.trail, "rgba(58, 216, 255, 0.52)", 2);
   }
 
-  if (state.target) {
-    drawMarker(state.target.x, state.target.y, "Target", "rgba(255, 141, 58, 0.95)");
+  if (state.waypoint) {
+    drawMarker(state.waypoint.x, state.waypoint.y, "Patrol WP", "rgba(255, 141, 58, 0.95)");
   }
 
   const robot = worldToCanvas(state.robot.x, state.robot.y);
@@ -288,7 +288,9 @@ function updateText() {
   modeText.textContent = state.mode;
   positionText.textContent = `x ${state.robot.x.toFixed(2)} / y ${state.robot.y.toFixed(2)}`;
   yawText.textContent = `${(state.robot.yaw * 180 / Math.PI).toFixed(1)} deg`;
-  targetText.textContent = state.target ? `x ${state.target.x.toFixed(1)} / y ${state.target.y.toFixed(1)}` : "none";
+  waypointText.textContent = state.waypoint
+    ? `x ${state.waypoint.x.toFixed(1)} / y ${state.waypoint.y.toFixed(1)}`
+    : "none";
 
   const alertActive = Date.now() - state.lastAlertTime < 4500;
   alertBlock.classList.toggle("active", alertActive);
