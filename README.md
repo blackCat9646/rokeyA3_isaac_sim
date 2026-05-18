@@ -41,6 +41,41 @@ Keyboard control:
 - `LEFT` / `RIGHT`: strafe
 - `N` / `M`: yaw left / right
 
+## Demo Quick Start
+
+Use these wrappers for the current stable DMZ Sentry demo. They keep the long terrain, YOLO, GPU, and rqt-friendly image settings in one place.
+
+Terminal 1: start Isaac Sim:
+
+```bash
+cd /home/rokey/dev_ws/dmz_sentry
+./scripts/demo_dmz_sim.sh
+```
+
+Terminal 2: start YOLO person detection:
+
+```bash
+cd /home/rokey/dev_ws/dmz_sentry
+./scripts/demo_yolo_detector.sh
+```
+
+Optional rqt view:
+
+```bash
+rqt_image_view /camera/annotated
+```
+
+The detector wrapper uses the calibrated model on GPU `0`, `confidence=0.25`, `image_size=320`, `publish_annotated=true`, `annotated_scale=0.5`, and `every_n=1`. The half-size annotated image keeps rqt responsive while the detector still runs on the resized YOLO input.
+
+Useful overrides:
+
+```bash
+./scripts/demo_dmz_sim.sh --intruder-count 5 --intruder-speed 0.65
+YOLO_PUBLISH_ANNOTATED=false ./scripts/demo_yolo_detector.sh
+YOLO_CONFIDENCE=0.35 ./scripts/demo_yolo_detector.sh
+YOLO_ANNOTATED_SCALE=1.0 ./scripts/demo_yolo_detector.sh
+```
+
 ## ROS 2 Teleoperation
 
 Start Isaac Sim:
@@ -172,26 +207,14 @@ Run Isaac Sim first:
 
 ```bash
 cd /home/rokey/dev_ws/dmz_sentry
-./scripts/run_anymal_gp.sh \
-  --terrain-texture /home/rokey/dev_ws/dmz_sentry/assets/materials/Ground081_2K-JPG/Ground081_2K-JPG_Color.jpg \
-  --terrain-normal-texture /home/rokey/dev_ws/dmz_sentry/assets/materials/Ground081_2K-JPG/Ground081_2K-JPG_NormalGL.jpg \
-  --terrain-roughness-texture /home/rokey/dev_ws/dmz_sentry/assets/materials/Ground081_2K-JPG/Ground081_2K-JPG_Roughness.jpg \
-  --terrain-texture-scale 12 \
-  --no-ground-detail \
-  --no-ros2-lidar
+./scripts/demo_dmz_sim.sh
 ```
 
 In another terminal, start the detector:
 
 ```bash
 cd /home/rokey/dev_ws/dmz_sentry
-./scripts/run_yolo_person_detector.sh --ros-args \
-  -p model:=/home/rokey/dev_ws/dmz_sentry/models/dmz_person_calibration_001_best.pt \
-  -p device:="'0'" \
-  -p confidence:=0.25 \
-  -p image_size:=320 \
-  -p publish_annotated:=false \
-  -p every_n:=1
+./scripts/demo_yolo_detector.sh
 ```
 
 Outputs:
@@ -203,28 +226,16 @@ Outputs:
 By default, annotated image publishing is off to keep the system light. Use `/detections_text` and `/alerts` for robot logic:
 
 ```bash
-./scripts/run_yolo_person_detector.sh --ros-args \
-  -p model:=/home/rokey/dev_ws/dmz_sentry/models/dmz_person_calibration_001_best.pt \
-  -p device:="'0'" \
-  -p confidence:=0.25 \
-  -p image_size:=320 \
-  -p publish_annotated:=false \
-  -p every_n:=1
+YOLO_PUBLISH_ANNOTATED=false ./scripts/demo_yolo_detector.sh
 ```
 
 To inspect bounding boxes in rqt:
 
 ```bash
-./scripts/run_yolo_person_detector.sh --ros-args \
-  -p model:=/home/rokey/dev_ws/dmz_sentry/models/dmz_person_calibration_001_best.pt \
-  -p device:="'0'" \
-  -p confidence:=0.25 \
-  -p image_size:=320 \
-  -p publish_annotated:=true \
-  -p every_n:=1
+./scripts/demo_yolo_detector.sh
 ```
 
-Then view `/camera/annotated` in `rqt_image_view`.
+Then view `/camera/annotated` in `rqt_image_view`. If the view lags, keep `YOLO_ANNOTATED_SCALE=0.5` or disable annotated publishing and rely on `/detections_text` and `/alerts`.
 
 ## Workspace Layout
 

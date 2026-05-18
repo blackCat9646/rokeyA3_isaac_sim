@@ -20,10 +20,11 @@ class YoloPersonDetector(Node):
         self.declare_parameter("alerts_topic", "/alerts")
         self.declare_parameter("model", "yolov8n.pt")
         self.declare_parameter("confidence", 0.35)
-        self.declare_parameter("image_size", 640)
+        self.declare_parameter("image_size", 320)
         self.declare_parameter("every_n", 2)
         self.declare_parameter("device", "")
         self.declare_parameter("publish_annotated", False)
+        self.declare_parameter("annotated_scale", 0.5)
         self.declare_parameter("alert_confidence", 0.20)
         self.declare_parameter("alert_cooldown", 1.0)
 
@@ -37,6 +38,7 @@ class YoloPersonDetector(Node):
         self._every_n = max(1, int(self.get_parameter("every_n").value))
         self._device = self.get_parameter("device").get_parameter_value().string_value.strip()
         self._publish_annotated = bool(self.get_parameter("publish_annotated").value)
+        self._annotated_scale = float(self.get_parameter("annotated_scale").value)
         self._alert_confidence = float(self.get_parameter("alert_confidence").value)
         self._alert_cooldown = max(0.0, float(self.get_parameter("alert_cooldown").value))
 
@@ -68,7 +70,8 @@ class YoloPersonDetector(Node):
         self.get_logger().info(
             "YOLO person detector ready: "
             f"image={self._image_topic}, detections={self._detections_topic}, "
-            f"alerts={self._alerts_topic}, annotated={self._publish_annotated}, model={self._model_name}"
+            f"alerts={self._alerts_topic}, annotated={self._publish_annotated}, "
+            f"annotated_scale={self._annotated_scale:.2f}, model={self._model_name}"
         )
 
     def _to_bgr(self, msg: Image):
@@ -108,6 +111,18 @@ class YoloPersonDetector(Node):
         msg.step = int(image.shape[1] * 3)
         msg.data = np.ascontiguousarray(image).tobytes()
         return msg
+
+    def _resize_annotated(self, image):
+        scale = self._annotated_scale
+        if scale >= 0.999:
+            return image
+        if scale <= 0.0:
+            self.get_logger().warn("annotated_scale must be > 0.0; using original annotated image")
+            return image
+
+        width = max(1, int(round(image.shape[1] * scale)))
+        height = max(1, int(round(image.shape[0] * scale)))
+        return cv2.resize(image, (width, height), interpolation=cv2.INTER_AREA)
 
     def _on_image(self, msg: Image) -> None:
         self._frame_count += 1
@@ -149,6 +164,7 @@ class YoloPersonDetector(Node):
 
         if self._annotated_pub is not None:
             annotated = result.plot()
+            annotated = self._resize_annotated(annotated)
             annotated_msg = self._to_image_msg(annotated, msg.header)
             self._annotated_pub.publish(annotated_msg)
 
