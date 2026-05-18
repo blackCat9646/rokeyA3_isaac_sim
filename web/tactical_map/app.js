@@ -284,8 +284,8 @@ function drawMap() {
   drawWorldRect(WORLD_MIN, 21, WORLD_MAX, WORLD_MAX, "rgba(30, 104, 142, 0.24)", "rgba(58, 216, 255, 0.22)");
   drawWorldLine([{ x: WORLD_MIN, y: 16 }, { x: WORLD_MAX, y: 16 }], "rgba(230, 198, 75, 0.88)", 3);
   drawWorldLine([{ x: WORLD_MIN + 5, y: 10 }, { x: WORLD_MAX - 5, y: 10 }], "rgba(140, 105, 52, 0.88)", 4, [10, 7]);
-  drawWorldLine([{ x: -22, y: 12 }, { x: 22, y: 12 }], "rgba(54, 244, 154, 0.72)", 2);
-  drawWorldLine([{ x: state.home.x, y: state.home.y }, { x: state.home.x, y: 12 }], "rgba(58, 216, 255, 0.35)", 2, [5, 8]);
+  drawWorldLine([{ x: -24, y: -12 }, { x: 24, y: -12 }], "rgba(54, 244, 154, 0.72)", 2);
+  drawWorldLine([{ x: state.home.x, y: state.home.y }, { x: state.home.x, y: -12 }], "rgba(58, 216, 255, 0.35)", 2, [5, 8]);
 
   drawMarker(state.home.x, state.home.y, "HOME", "rgba(58, 216, 255, 0.95)");
   drawMarker(-24.8, 10, "Tower W", "rgba(230, 198, 75, 0.95)");
