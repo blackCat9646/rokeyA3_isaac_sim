@@ -150,6 +150,51 @@ ros2 topic pub --once /mission_command std_msgs/msg/String "{data: start_patrol}
 ros2 topic echo /patrol_state
 ```
 
+### Nav2 Patrol Prototype
+
+The Nav2 prototype keeps the same web buttons and mission topics, but replaces the direct waypoint `/cmd_vel`
+controller with Nav2 planning. It uses the Isaac Sim `world` frame as the Nav2 global frame and a small static
+occupancy map for the fence, river, bunkers, and towers. A safety filter sits after Nav2 so ANYmal receives either
+turning or forward commands, not both at the same time.
+
+Run it with the simulation already publishing `/odom` and TF:
+
+```bash
+# Terminal 1: Isaac Sim
+cd /home/rokey/dev_ws/dmz_sentry
+./scripts/demo_dmz_sim.sh
+
+# Terminal 2: Nav2 stack
+cd /home/rokey/dev_ws/dmz_sentry
+./scripts/demo_nav2_bringup.sh
+
+# Terminal 3: Nav2 mission controller
+cd /home/rokey/dev_ws/dmz_sentry
+./scripts/demo_nav2_patrol_controller.sh
+
+# Terminal 4: ROS bridge websocket
+cd /home/rokey/dev_ws/dmz_sentry
+./scripts/demo_rosbridge.sh
+
+# Terminal 5: tactical web map
+cd /home/rokey/dev_ws/dmz_sentry
+./scripts/demo_tactical_map.sh
+```
+
+Useful checks:
+
+```bash
+source /opt/ros/humble/setup.bash
+source /home/rokey/dev_ws/dmz_sentry/ros2_ws/install/setup.bash
+export ROS_DOMAIN_ID=129
+ros2 action list | grep navigate_to_pose
+ros2 topic echo /cmd_vel_nav2_raw
+ros2 topic echo /cmd_vel
+```
+
+This is intentionally a known-map Nav2 setup, not SLAM. SLAM can be added later if the project needs mapping, but
+for the DMZ demo the static world map is enough to test patrol goals and obstacle-aware paths.
+
 ## ROS 2 Teleoperation
 
 Start Isaac Sim:

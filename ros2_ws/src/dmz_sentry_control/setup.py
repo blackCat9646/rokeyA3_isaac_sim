@@ -1,3 +1,5 @@
+from glob import glob
+
 from setuptools import find_packages, setup
 
 package_name = "dmz_sentry_control"
@@ -9,6 +11,9 @@ setup(
     data_files=[
         ("share/ament_index/resource_index/packages", [f"resource/{package_name}"]),
         (f"share/{package_name}", ["package.xml"]),
+        (f"share/{package_name}/config", glob("config/*.yaml")),
+        (f"share/{package_name}/launch", glob("launch/*.launch.py")),
+        (f"share/{package_name}/maps", glob("maps/*")),
     ],
     install_requires=["setuptools"],
     zip_safe=True,
@@ -19,6 +24,8 @@ setup(
     tests_require=["pytest"],
     entry_points={
         "console_scripts": [
+            "cmd_vel_safety_filter = dmz_sentry_control.cmd_vel_safety_filter:main",
+            "nav2_patrol_controller = dmz_sentry_control.nav2_patrol_controller:main",
             "patrol_controller = dmz_sentry_control.patrol_controller:main",
         ],
     },
