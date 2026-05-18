@@ -20,6 +20,7 @@ const state = {
   waypoint: null,
   mode: "IDLE",
   trail: [],
+  intruders: [],
   lastAlert: null,
   lastAlertTime: 0,
 };
@@ -70,6 +71,7 @@ function connectRosbridge() {
     subscribe("/odom", "nav_msgs/Odometry");
     subscribe("/alerts", "std_msgs/String");
     subscribe("/patrol_state", "std_msgs/String");
+    subscribe("/intruder_states", "std_msgs/String");
     advertise("/mission_command", "std_msgs/String");
   });
 
@@ -94,6 +96,8 @@ function connectRosbridge() {
       handleAlert(packet.msg);
     } else if (packet.topic === "/patrol_state") {
       handlePatrolState(packet.msg);
+    } else if (packet.topic === "/intruder_states") {
+      handleIntruderStates(packet.msg);
     }
   });
 }
@@ -152,6 +156,15 @@ function handleAlert(msg) {
   state.lastAlert = summary;
   state.lastAlertTime = Date.now();
   logEvent(`ALERT ${summary}`);
+}
+
+function handleIntruderStates(msg) {
+  try {
+    const payload = JSON.parse(msg.data);
+    state.intruders = Array.isArray(payload.intruders) ? payload.intruders : [];
+  } catch (error) {
+    logEvent("failed to parse intruder states");
+  }
 }
 
 function handlePatrolState(msg) {
@@ -232,6 +245,29 @@ function drawMarker(x, y, label, color) {
   ctx.fillText(label, p.x + 9, p.y - 8);
 }
 
+function drawIntruderMarker(intruder) {
+  const p = worldToCanvas(Number(intruder.x || 0), Number(intruder.y || 0));
+  const label = `Person ${intruder.id ?? "?"}`;
+  ctx.save();
+  ctx.fillStyle = "rgba(255, 82, 82, 0.95)";
+  ctx.strokeStyle = "rgba(255, 214, 128, 0.88)";
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.arc(p.x, p.y, 7, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.arc(p.x, p.y, 15 + 3 * Math.sin(Date.now() / 220), 0, Math.PI * 2);
+  ctx.strokeStyle = "rgba(255, 82, 82, 0.28)";
+  ctx.stroke();
+  ctx.fillStyle = "rgba(255, 214, 128, 0.94)";
+  ctx.font = "12px monospace";
+  ctx.fillText(label, p.x + 11, p.y - 10);
+  ctx.fillStyle = "rgba(200, 246, 223, 0.76)";
+  ctx.fillText(`x ${Number(intruder.x || 0).toFixed(1)} / y ${Number(intruder.y || 0).toFixed(1)}`, p.x + 11, p.y + 4);
+  ctx.restore();
+}
+
 function drawMap() {
   const rect = canvas.getBoundingClientRect();
   ctx.clearRect(0, 0, rect.width, rect.height);
@@ -256,6 +292,8 @@ function drawMap() {
   if (state.waypoint) {
     drawMarker(state.waypoint.x, state.waypoint.y, "Patrol WP", "rgba(255, 141, 58, 0.95)");
   }
+
+  state.intruders.forEach(drawIntruderMarker);
 
   const robot = worldToCanvas(state.robot.x, state.robot.y);
   const isAlert = Date.now() - state.lastAlertTime < 4500;
@@ -294,7 +332,16 @@ function updateText() {
 
   const alertActive = Date.now() - state.lastAlertTime < 4500;
   alertBlock.classList.toggle("active", alertActive);
-  alertText.textContent = alertActive && state.lastAlert ? state.lastAlert : "No active alert";
+  if (alertActive && state.lastAlert) {
+    const intruderSummary = state.intruders.length
+      ? ` | ${state.intruders.length} tracked on map`
+      : "";
+    alertText.textContent = `${state.lastAlert}${intruderSummary}`;
+  } else {
+    alertText.textContent = state.intruders.length
+      ? `${state.intruders.length} intruder position(s) tracked`
+      : "No active alert";
+  }
 }
 
 function animate() {

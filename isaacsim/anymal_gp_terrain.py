@@ -18,6 +18,7 @@ from isaacsim import SimulationApp
 simulation_app = SimulationApp({"headless": False})
 
 import argparse
+import json
 import carb
 import numpy as np
 import omni
@@ -234,6 +235,48 @@ DEFAULT_INTRUDER_HUMAN_ASSETS = (
     "original_male_adult_construction_05",
     "original_male_adult_construction_02",
 )
+
+
+class _OptionalRosStringPublisher:
+    def __init__(self, node_name: str, topic_name: str) -> None:
+        self._rclpy = None
+        self._string_type = None
+        self._node = None
+        self._publisher = None
+        self._owns_context = False
+
+        try:
+            import rclpy
+            from std_msgs.msg import String
+        except Exception as exc:
+            carb.log_warn(f"ROS 2 Python publisher unavailable for {topic_name}: {exc}")
+            return
+
+        try:
+            if not rclpy.ok():
+                rclpy.init(args=None)
+                self._owns_context = True
+            self._node = rclpy.create_node(node_name)
+            self._publisher = self._node.create_publisher(String, topic_name, 10)
+            self._rclpy = rclpy
+            self._string_type = String
+            print(f"ROS 2 string publisher enabled: {topic_name}")
+        except Exception as exc:
+            carb.log_warn(f"Failed to create ROS 2 Python publisher for {topic_name}: {exc}")
+
+    def publish(self, data: str) -> None:
+        if self._publisher is None or self._string_type is None:
+            return
+        msg = self._string_type()
+        msg.data = data
+        self._publisher.publish(msg)
+
+    def shutdown(self) -> None:
+        if self._node is not None:
+            self._node.destroy_node()
+            self._node = None
+        if self._owns_context and self._rclpy is not None and self._rclpy.ok():
+            self._rclpy.shutdown()
 
 
 def _smoothstep(value: np.ndarray) -> np.ndarray:
@@ -936,6 +979,7 @@ class IntruderScenario:
             state = {
                 "path": path,
                 "translate_op": handles["translate_op"],
+                "visual_type": handles.get("visual_type", "unknown"),
                 "phase": float(self._rng.uniform(0.0, np.pi * 2.0)),
                 "time": 0.0,
             }
@@ -986,6 +1030,26 @@ class IntruderScenario:
             self._set_intruder_pose(state)
             positions.append(state["position"].copy())
         return positions
+
+    def get_intruder_reports(self) -> list[dict]:
+        reports = []
+        for index, state in enumerate(self._intruders):
+            position = state["position"]
+            ground_z = _sample_height(self._x_values, self._y_values, self._heights, position[0], position[1])
+            reports.append(
+                {
+                    "id": index,
+                    "label": "person",
+                    "path": state["path"],
+                    "visual_type": state.get("visual_type", "unknown"),
+                    "x": float(position[0]),
+                    "y": float(position[1]),
+                    "z": float(ground_z),
+                    "arrived": bool(state["arrived"]),
+                    "target_y": float(state["target_y"]),
+                }
+            )
+        return reports
 
     def _set_intruder_pose(self, state: dict) -> None:
         position = state["position"]
@@ -1866,6 +1930,14 @@ class Anymal_runner(object):
             if enable_intruder
             else None
         )
+        self._sim_time = 0.0
+        self._last_intruder_state_publish_time = -1.0
+        self._intruder_state_publisher = (
+            _OptionalRosStringPublisher("dmz_sentry_intruder_state_publisher", "/intruder_states")
+            if self._intruder_scenario is not None
+            and (enable_ros2_sensors or enable_ros2_cmd_vel or enable_ros2_odom)
+            else None
+        )
 
         self._anymal = AnymalFlatTerrainPolicy(
             prim_path="/World/Anymal",
@@ -1996,7 +2068,22 @@ class Anymal_runner(object):
         return self._keyboard_command
 
     def shutdown(self) -> None:
-        return
+        if self._intruder_state_publisher is not None:
+            self._intruder_state_publisher.shutdown()
+
+    def _publish_intruder_states(self, force: bool = False) -> None:
+        if self._intruder_scenario is None or self._intruder_state_publisher is None:
+            return
+        if not force and self._sim_time - self._last_intruder_state_publish_time < 0.2:
+            return
+
+        payload = {
+            "stamp": self._sim_time,
+            "frame_id": "world",
+            "intruders": self._intruder_scenario.get_intruder_reports(),
+        }
+        self._intruder_state_publisher.publish(json.dumps(payload))
+        self._last_intruder_state_publish_time = self._sim_time
 
     def setup(self) -> None:
         """
@@ -2018,6 +2105,7 @@ class Anymal_runner(object):
             self._anymal.initialize()
             if self._intruder_scenario is not None:
                 self._intruder_scenario.update(0.0)
+                self._publish_intruder_states(force=True)
             self._update_lidar_follow_pose()
             self.first_step = False
         elif self.needs_reset:
@@ -2029,6 +2117,8 @@ class Anymal_runner(object):
             self._anymal.forward(step_size, self._base_command)
             if self._intruder_scenario is not None:
                 self._intruder_scenario.update(step_size)
+                self._sim_time += float(step_size)
+                self._publish_intruder_states()
             self._update_lidar_follow_pose()
 
     def generate_replicator_dataset(

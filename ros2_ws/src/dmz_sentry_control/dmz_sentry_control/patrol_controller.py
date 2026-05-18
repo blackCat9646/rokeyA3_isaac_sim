@@ -40,11 +40,12 @@ class PatrolController(Node):
         self.declare_parameter("patrol_y", 12.0)
         self.declare_parameter("patrol_x_min", -22.0)
         self.declare_parameter("patrol_x_max", 22.0)
-        self.declare_parameter("waypoint_tolerance", 1.0)
-        self.declare_parameter("max_linear_command", 0.55)
-        self.declare_parameter("max_yaw_command", 0.65)
-        self.declare_parameter("position_gain", 0.22)
-        self.declare_parameter("yaw_gain", 1.2)
+        self.declare_parameter("waypoint_tolerance", 1.5)
+        self.declare_parameter("max_linear_command", 1.0)
+        self.declare_parameter("max_yaw_command", 1.0)
+        self.declare_parameter("position_gain", 0.45)
+        self.declare_parameter("yaw_gain", 1.6)
+        self.declare_parameter("heading_tolerance", 0.35)
         self.declare_parameter("alert_hold_seconds", 6.0)
 
         self._mission_topic = self.get_parameter("mission_topic").get_parameter_value().string_value
@@ -62,6 +63,7 @@ class PatrolController(Node):
         self._max_yaw_command = max(0.05, float(self.get_parameter("max_yaw_command").value))
         self._position_gain = max(0.01, float(self.get_parameter("position_gain").value))
         self._yaw_gain = max(0.01, float(self.get_parameter("yaw_gain").value))
+        self._heading_tolerance = max(0.02, float(self.get_parameter("heading_tolerance").value))
         self._alert_hold_seconds = max(0.0, float(self.get_parameter("alert_hold_seconds").value))
 
         self._mode = PatrolMode.IDLE
@@ -165,17 +167,19 @@ class PatrolController(Node):
         dx_body = cos_yaw * dx_world + sin_yaw * dy_world
         dy_body = -sin_yaw * dx_world + cos_yaw * dy_world
 
+        desired_yaw = math.atan2(dy_world, dx_world)
+        yaw_error = _wrap_angle(desired_yaw - yaw)
+        if abs(yaw_error) > self._heading_tolerance:
+            msg.angular.z = float(
+                max(-self._max_yaw_command, min(self._max_yaw_command, yaw_error * self._yaw_gain))
+            )
+            return msg
+
         msg.linear.x = float(
             max(-self._max_linear_command, min(self._max_linear_command, dx_body * self._position_gain))
         )
         msg.linear.y = float(
             max(-self._max_linear_command, min(self._max_linear_command, dy_body * self._position_gain))
-        )
-
-        desired_yaw = math.atan2(dy_world, dx_world)
-        yaw_error = _wrap_angle(desired_yaw - yaw)
-        msg.angular.z = float(
-            max(-self._max_yaw_command, min(self._max_yaw_command, yaw_error * self._yaw_gain))
         )
         return msg
 
