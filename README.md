@@ -1,86 +1,260 @@
 # DMZ Sentry
 
-Isaac Sim + ROS 2 Humble based autonomous reconnaissance quadruped simulation.
+Isaac Sim과 ROS 2 Humble을 이용한 4족 보행 정찰 로봇 시뮬레이션 프로젝트입니다.  
+ANYmal이 DMZ 스타일의 울타리, 강가, 벙커, 감시탑이 있는 환경을 순찰하고, 카메라 기반 YOLO 사람 감지, Nav2 기반 순찰, 웹 전술 지도, 관측용 줌 카메라를 함께 사용합니다.
 
-## Current Status
+## 현재 구현된 기능
 
-- Isaac Sim 5.1 standalone scene
-- ANYmal C flat-terrain policy teleoperation
-- GP-style terrain with fence, river, bunkers, watchtowers, and warning signs
-- Denser border visuals: double fence, wire mesh, concertina wire, patrol road, lights, river markers, and reeds
-- Moving intruder scenario for camera-based detection experiments
-- RGB-D camera, RTX LiDAR, odometry, TF, and clock ROS 2 publishing
+- Isaac Sim standalone 시뮬레이션
+- ANYmal 기반 4족 보행 로봇
+- GP 스타일 지형, 울타리, 강, 벙커, 감시탑, 경고 표지, 조명
+- 움직이는 사람 target 시나리오
+- RGB-D 감지 카메라
+- 별도 관측용 Inspector 카메라
+- YOLOv8 사람 감지
+- `/alerts` 기반 경보 발생
+- Nav2 기반 waypoint 순찰
+- 웹 전술 지도
+- 웹에서 출격, 홈, 정지, 재개 명령
+- 웹에서 target 클릭 시 Inspector 카메라가 해당 target을 바라봄
+- 웹에서 Inspector 카메라 pan/tilt/zoom 수동 조작
+- target 확인 처리: Clear 버튼을 누르면 Confirmed 초록색 상태로 변경
 
-## Run
+## 전체 구조
 
-Open a terminal:
+```text
+Isaac Sim
+  ANYmal
+  SentryFrontCamera          YOLO 감지용 카메라
+  SentryInspectionCamera     target 확인/줌 관측용 카메라
+  IntruderScenario           움직이는 사람 target
+  /camera/image_raw
+  /camera/depth
+  /inspection_camera/image_raw
+  /odom
+  /tf
 
-```bash
-cd /home/rokey/dev_ws/dmz_sentry
-./scripts/run_anymal_gp.sh
+ROS 2
+  yolo_person_detector       사람 감지, /alerts 발행
+  inspection_bridge          웹 명령과 Isaac Sim 파일 브리지 연결
+  Nav2                       경로 계획과 순찰 주행
+  nav2_patrol_controller     웹 mission command를 Nav2 goal로 변환
+  rosbridge                  웹과 ROS 2 연결
+
+Web
+  tactical_map               전술 지도, target 표시, 출격/정지/카메라 제어
 ```
 
-Useful options:
+## Target 위치 표시 방식
 
-```bash
-./scripts/run_anymal_gp.sh --no-ros2-sensors
-./scripts/run_anymal_gp.sh --no-ros2-cmd-vel
-./scripts/run_anymal_gp.sh --no-ros2-odom
-./scripts/run_anymal_gp.sh --no-intruder
-./scripts/run_anymal_gp.sh --intruder-count 3 --intruder-speed 0.65
-./scripts/run_anymal_gp.sh --intruder-count 3 --intruder-speed 0.65 --intruder-visual isaac-human --intruder-yaw-deg 90
-./scripts/run_anymal_gp.sh --terrain-amplitude 0.20
-./scripts/run_anymal_gp.sh --terrain-seed 11
-./scripts/run_anymal_gp.sh --terrain-texture /path/to/orthophoto.png --terrain-texture-scale 1 --no-ground-detail
-./scripts/run_anymal_gp.sh --terrain-texture /path/to/ground_albedo.jpg --terrain-normal-texture /path/to/ground_normal.jpg --terrain-roughness-texture /path/to/ground_roughness.jpg --terrain-texture-scale 12 --no-ground-detail
+현재 웹에 표시되는 target 위치는 Isaac Sim 내부의 시뮬레이션 좌표를 사용합니다.
+
+```text
+Isaac Sim IntruderScenario
+→ /tmp/dmz_sentry_intruder_states.json
+→ inspection_bridge
+→ /intruder_states
+→ web tactical map
 ```
 
-Keyboard control:
+즉 지금은 **YOLO + Depth로 실제 위치를 추정한 방식이 아니라**, 시뮬레이션이 알고 있는 ground-truth 좌표를 웹에 표시합니다.  
+YOLO는 target 표시를 위한 위치 계산보다는 사람 감지와 alert 발생에 사용됩니다.
 
-- `UP` / `DOWN`: forward / backward
-- `LEFT` / `RIGHT`: strafe
-- `N` / `M`: yaw left / right
+추후 현실적인 방식으로 확장하려면 다음 구조로 바꿀 수 있습니다.
 
-## Demo Quick Start
-
-Use these wrappers for the current stable DMZ Sentry demo. They keep the long terrain, YOLO, GPU, and rqt-friendly image settings in one place.
-
-Terminal 1: start Isaac Sim:
-
-```bash
-cd /home/rokey/dev_ws/dmz_sentry
-./scripts/demo_dmz_sim.sh
+```text
+YOLO bbox
++ /camera/depth
++ /camera/camera_info
++ TF
+→ world 좌표 추정
+→ /tracked_targets publish
 ```
 
-Terminal 2: start YOLO person detection:
+또는 3D LiDAR를 사용할 경우:
 
-```bash
-cd /home/rokey/dev_ws/dmz_sentry
-./scripts/demo_yolo_detector.sh
+```text
+YOLO bbox
++ LiDAR point cloud projection
+→ bbox 안 point cloud cluster
+→ target 3D 위치 추정
 ```
 
-Optional rqt view:
+## 웹 전술 지도 기능
 
-```bash
-rqt_image_view /camera/annotated
+웹 지도는 `web/tactical_map`에 있습니다.
+
+기능:
+
+- 로봇 현재 위치 표시
+- 순찰 waypoint 표시
+- target 위치 표시
+- YOLO alert 상태 표시
+- target 클릭 시 Inspector 카메라가 해당 target을 바라봄
+- Confirmed target은 초록색으로 표시
+- target이 재소환되어 위치가 크게 바뀌면 Confirmed 상태 자동 해제
+
+버튼:
+
+- `출격`: 순찰 시작
+- `홈`: 홈 위치로 복귀
+- `정지`: 정지
+- `재개`: 이전 순찰 모드 재개
+- `Pan Left / Pan Right`: Inspector 카메라 좌우 조작
+- `Tilt Up / Tilt Down`: Inspector 카메라 상하 조작
+- `Center`: Inspector 카메라 정면 복귀
+- `Zoom + / Zoom -`: Inspector 카메라 줌 인/아웃
+- `Reset`: 줌 초기화
+- `Clear`: target 추적 해제, 선택 target을 Confirmed 상태로 변경
+
+## Inspector 카메라
+
+기존 카메라는 YOLO 감지용으로 계속 넓게 앞을 봅니다.  
+Inspector 카메라는 target 확인용으로 따로 추가된 관측 카메라입니다.
+
+```text
+SentryFrontCamera
+  YOLO 감지용
+  /camera/image_raw
+  /camera/annotated
+
+SentryInspectionCamera
+  target 확인/줌 관측용
+  /inspection_camera/image_raw
 ```
 
-The detector wrapper uses the calibrated model on GPU `0`, `confidence=0.25`, `image_size=320`, `publish_annotated=true`, `annotated_scale=0.5`, and `every_n=1`. The half-size annotated image keeps rqt responsive while the detector still runs on the resized YOLO input.
+웹에서 target을 클릭하면 `/inspection_camera/command`가 발행되고, `inspection_bridge`가 이 명령을 Isaac Sim에 전달합니다. Isaac Sim은 해당 좌표를 바라보도록 Inspector 카메라 방향을 갱신합니다.
 
-Useful overrides:
+현재 Inspector 카메라는 실제 물리 짐벌 모델이 아니라, 코드로 카메라 방향을 바꾸는 **가상 짐벌** 방식입니다.
 
-```bash
-./scripts/demo_dmz_sim.sh --intruder-count 5 --intruder-speed 0.65
-YOLO_PUBLISH_ANNOTATED=false ./scripts/demo_yolo_detector.sh
-YOLO_CONFIDENCE=0.35 ./scripts/demo_yolo_detector.sh
-YOLO_ANNOTATED_SCALE=1.0 ./scripts/demo_yolo_detector.sh
+## YOLO 사람 감지
+
+현재 사용하는 학습 모델:
+
+```text
+models/dmz_person_calibration_001_best.pt
 ```
 
-## Tactical Map and Patrol
+YOLO 노드:
 
-The tactical map is a lightweight web view for the DMZ simulation coordinate frame. It draws the fence line, river band, safe patrol lane, towers, robot marker, current patrol waypoint, simulated intruder positions, and YOLO alert state. The web buttons publish high-level mission commands only; the ROS 2 patrol controller owns `/cmd_vel`.
+```text
+ros2_ws/src/dmz_sentry_perception/dmz_sentry_perception/yolo_person_detector.py
+```
 
-Build the ROS 2 workspace after pulling or changing control nodes:
+출력 토픽:
+
+- `/detections_text`: 감지 결과 JSON
+- `/alerts`: confidence 기준 이상이면 alert 발행
+- `/camera/annotated`: bbox가 그려진 확인용 이미지
+
+학습 데이터 변환 스크립트:
+
+```text
+scripts/convert_replicator_to_yolo.py
+```
+
+학습은 별도 Python 코드가 아니라 Ultralytics CLI로 수행했습니다.
+
+```bash
+yolo detect train \
+  model=yolov8n.pt \
+  data=/home/rokey/dev_ws/dmz_sentry/datasets/yolo_person_calibration_001/data.yaml \
+  epochs=50 \
+  imgsz=640 \
+  device=0 \
+  project=/home/rokey/dev_ws/dmz_sentry/runs/yolo \
+  name=dmz_person_calibration_001
+```
+
+## Nav2 순찰
+
+현재 순찰은 Nav2 기반입니다.
+
+```text
+web 출격 버튼
+→ /mission_command
+→ nav2_patrol_controller
+→ /navigate_to_pose action
+→ Nav2
+→ /cmd_vel_nav2_raw
+→ cmd_vel_safety_filter
+→ /cmd_vel
+→ Isaac Sim ANYmal
+```
+
+이 프로젝트에서는 SLAM을 아직 사용하지 않습니다.  
+현재는 DMZ 환경을 알고 있다고 가정하고, 정적 map과 `world` frame을 이용하는 known-map 방식입니다.
+
+Nav2 확인용 명령:
+
+```bash
+ros2 action list | grep navigate_to_pose
+ros2 topic echo /patrol_state
+ros2 topic echo /cmd_vel
+```
+
+`/navigate_to_pose`가 없으면 Nav2가 켜지지 않은 상태입니다.
+
+## 자주 확인하는 토픽
+
+```bash
+ros2 topic hz /camera/image_raw
+ros2 topic hz /camera/annotated
+ros2 topic hz /inspection_camera/image_raw
+ros2 topic echo /intruder_states --once
+ros2 topic echo /alerts --once
+ros2 topic echo /patrol_state
+ros2 topic info /inspection_camera/command
+```
+
+정상 상태 예:
+
+```text
+/camera/image_raw             average rate ...
+/inspection_camera/image_raw  average rate ...
+/intruder_states              data: "{...}"
+/inspection_camera/command    Publisher count 1, Subscription count 1
+/navigate_to_pose             action 존재
+```
+
+## 폴더 구조
+
+```text
+dmz_sentry/
+  isaacsim/
+    anymal_gp_terrain.py              Isaac Sim 메인 시뮬레이션
+
+  ros2_ws/src/dmz_sentry_perception/
+    yolo_person_detector.py           YOLO 사람 감지 노드
+
+  ros2_ws/src/dmz_sentry_control/
+    nav2_patrol_controller.py         Nav2 순찰 컨트롤러
+    cmd_vel_safety_filter.py          ANYmal 안정 주행용 속도 필터
+    inspection_bridge.py              웹/ROS/Isaac Sim 카메라 명령 브리지
+    config/nav2_dmz_params.yaml       Nav2 설정
+    maps/                             정적 지도
+
+  web/tactical_map/
+    index.html
+    app.js
+    style.css                         웹 전술 지도
+
+  scripts/
+    demo_dmz_sim.sh
+    demo_yolo_detector.sh
+    demo_inspection_bridge.sh
+    demo_nav2_bringup.sh
+    demo_nav2_patrol_controller.sh
+    demo_rosbridge.sh
+    demo_tactical_map.sh
+
+  models/
+    dmz_person_calibration_001_best.pt
+```
+
+## 빌드
+
+ROS 2 노드를 수정했거나 처음 실행하는 경우:
 
 ```bash
 cd /home/rokey/dev_ws/dmz_sentry/ros2_ws
@@ -88,308 +262,72 @@ source /opt/ros/humble/setup.bash
 colcon build --symlink-install
 ```
 
-Install rosbridge if it is not already available:
+## 실행 커맨드 정리
+
+아래 순서대로 터미널을 열어서 실행하면 현재 데모 전체가 동작합니다.
 
 ```bash
-sudo apt install ros-humble-rosbridge-suite
-```
-
-Run the full tactical demo:
-
-```bash
-# Terminal 1: Isaac Sim
+# Terminal 1: Isaac Sim 시뮬레이션
 cd /home/rokey/dev_ws/dmz_sentry
 ./scripts/demo_dmz_sim.sh
+```
 
-# Terminal 2: YOLO detector
+```bash
+# Terminal 2: Inspector 카메라/target 위치 브리지
+cd /home/rokey/dev_ws/dmz_sentry
+./scripts/demo_inspection_bridge.sh
+```
+
+```bash
+# Terminal 3: YOLO 사람 감지
 cd /home/rokey/dev_ws/dmz_sentry
 ./scripts/demo_yolo_detector.sh
+```
 
-# Terminal 3: waypoint patrol controller
+```bash
+# Terminal 4: Nav2 실행
 cd /home/rokey/dev_ws/dmz_sentry
-./scripts/demo_patrol_controller.sh
+./scripts/demo_nav2_bringup.sh
+```
 
-# Terminal 4: ROS bridge websocket
+```bash
+# Terminal 5: Nav2 순찰 컨트롤러
+cd /home/rokey/dev_ws/dmz_sentry
+./scripts/demo_nav2_patrol_controller.sh
+```
+
+```bash
+# Terminal 6: rosbridge websocket
 cd /home/rokey/dev_ws/dmz_sentry
 ./scripts/demo_rosbridge.sh
+```
 
-# Terminal 5: static tactical web map
+```bash
+# Terminal 7: 웹 전술 지도
 cd /home/rokey/dev_ws/dmz_sentry
 ./scripts/demo_tactical_map.sh
 ```
 
-Open:
+웹 브라우저에서 아래 주소를 엽니다.
 
 ```text
 http://localhost:8080
 ```
 
-The web controls publish:
-
-- `start_patrol` on `/mission_command`: patrol on the clear straight lane between Tower W and Tower E
-- `stop` on `/mission_command`: stop and hold position
-- `resume` on `/mission_command`: resume the previous patrol mode
-
-The patrol controller uses a conservative two-step motion style: turn in place toward the current waypoint first, then walk straight with yaw held still. This avoids the tip-over behavior seen when ANYmal receives forward and turning commands at the same time.
-
-Patrol topics:
-
-- `/mission_command` (`std_msgs/String`): high-level command from web or terminal
-- `/patrol_state` (`std_msgs/String` JSON): controller state for the web UI
-- `/cmd_vel` (`geometry_msgs/Twist`): velocity command sent to ANYmal
-- `/alerts` (`std_msgs/String` JSON): YOLO person alert, used to stop patrol temporarily
-- `/intruder_states` (`std_msgs/String` JSON): simulator ground-truth intruder positions for the tactical map
-
-Manual command test without the web UI:
+rqt로 카메라를 확인하려면:
 
 ```bash
-source /opt/ros/humble/setup.bash
-source /home/rokey/dev_ws/dmz_sentry/ros2_ws/install/setup.bash
-export ROS_DOMAIN_ID=129
-ros2 topic pub --once /mission_command std_msgs/msg/String "{data: start_patrol}"
-ros2 topic echo /patrol_state
+rqt_image_view
 ```
 
-### Nav2 Patrol Prototype
-
-The Nav2 prototype keeps the same web buttons and mission topics, but replaces the direct waypoint `/cmd_vel`
-controller with Nav2 planning. It uses the Isaac Sim `world` frame as the Nav2 global frame and a small static
-occupancy map for the fence, river, bunkers, and towers. A safety filter sits after Nav2 so ANYmal receives either
-turning or forward commands, not both at the same time.
-
-Run it with the simulation already publishing `/odom` and TF:
-
-```bash
-# Terminal 1: Isaac Sim
-cd /home/rokey/dev_ws/dmz_sentry
-./scripts/demo_dmz_sim.sh
-
-# Terminal 2: Nav2 stack
-cd /home/rokey/dev_ws/dmz_sentry
-./scripts/demo_nav2_bringup.sh
-
-# Terminal 3: Nav2 mission controller
-cd /home/rokey/dev_ws/dmz_sentry
-./scripts/demo_nav2_patrol_controller.sh
-
-# Terminal 4: ROS bridge websocket
-cd /home/rokey/dev_ws/dmz_sentry
-./scripts/demo_rosbridge.sh
-
-# Terminal 5: tactical web map
-cd /home/rokey/dev_ws/dmz_sentry
-./scripts/demo_tactical_map.sh
-```
-
-Useful checks:
-
-```bash
-source /opt/ros/humble/setup.bash
-source /home/rokey/dev_ws/dmz_sentry/ros2_ws/install/setup.bash
-export ROS_DOMAIN_ID=129
-ros2 action list | grep navigate_to_pose
-ros2 topic echo /cmd_vel_nav2_raw
-ros2 topic echo /cmd_vel
-```
-
-This is intentionally a known-map Nav2 setup, not SLAM. SLAM can be added later if the project needs mapping, but
-for the DMZ demo the static world map is enough to test patrol goals and obstacle-aware paths.
-
-## ROS 2 Teleoperation
-
-Start Isaac Sim:
-
-```bash
-cd /home/rokey/dev_ws/dmz_sentry
-./scripts/run_anymal_gp.sh
-```
-
-In another terminal:
-
-```bash
-source /opt/ros/humble/setup.bash
-export ROS_DOMAIN_ID=129
-ros2 run teleop_twist_keyboard teleop_twist_keyboard --ros-args -p repeat_rate:=20.0
-```
-
-Nonzero `/cmd_vel` has priority over the in-window keyboard fallback. Keep `repeat_rate` enabled so teleop publishes zero commands when you release the keys.
-
-## ROS 2 Check
-
-In another terminal:
-
-```bash
-source /opt/ros/humble/setup.bash
-export ROS_DOMAIN_ID=129
-ros2 topic list
-ros2 topic hz /camera/image_raw
-ros2 topic hz /lidar/points
-ros2 topic echo /odom --once
-```
-
-Expected topics:
-
-- `/camera/image_raw`
-- `/camera/depth`
-- `/camera/camera_info`
-- `/lidar/points`
-- `/odom`
-- `/tf`
-- `/clock`
-
-For RViz2, set `Fixed Frame` to `world`, then add `Image`, `PointCloud2`, and `Odometry` displays. The LiDAR is currently in stable world-mounted debug mode; robot-following LiDAR was left off because it caused Isaac Sim RTX LiDAR crashes on this setup.
-
-Current TF shape:
+감지 카메라:
 
 ```text
-world
-  base
-    SentryFrontCamera
-  SentryLidar
+/camera/annotated
 ```
 
-`SentryLidar` stays under `world` while the stable debug LiDAR is used.
-
-## Intruder Scenario
-
-By default, one simple person-shaped `Intruder_0` target spawns near the river side of the fence and walks toward the fence line. It is visually primitive on purpose so the scenario stays stable before replacing it with an animated human USD.
-
-Useful controls:
-
-```bash
-./scripts/run_anymal_gp.sh --intruder-count 1
-./scripts/run_anymal_gp.sh --intruder-count 3 --intruder-speed 0.65
-./scripts/run_anymal_gp.sh --intruder-visual isaac-human
-./scripts/run_anymal_gp.sh --no-intruder
-```
-
-The default `--intruder-visual auto` mode tries to load an Isaac Sim human character from the configured Isaac asset root, then falls back to the primitive target if the asset is unavailable. The intruder prims are labeled as semantic class `person`, which leaves a path for later Replicator synthetic-data or bounding-box experiments.
-
-If the default asset root is not configured, pass an explicit human USD:
-
-```bash
-./scripts/run_anymal_gp.sh --intruder-visual isaac-human --intruder-human-usd /path/or/url/to/human.usd
-```
-
-If the referenced human faces the wrong way, rotate it:
-
-```bash
-./scripts/run_anymal_gp.sh --intruder-visual isaac-human --intruder-yaw-deg 90
-./scripts/run_anymal_gp.sh --intruder-visual isaac-human --intruder-yaw-deg -90
-./scripts/run_anymal_gp.sh --intruder-visual isaac-human --intruder-yaw-deg 180
-```
-
-The Isaac human asset is currently a static visual target. Walking animation is a later step using either an animated human USD or Isaac Sim People/animation tooling.
-
-## Synthetic Data Direction
-
-Next dataset milestone:
+Inspector 카메라:
 
 ```text
-Isaac Sim GP scene
-  -> randomize intruder pose, distance, count, lighting, weather, and camera view
-  -> capture RGB + 2D bounding boxes with semantic label person
-  -> convert annotations to YOLO format
-  -> fine-tune YOLO
-  -> compare stock YOLO vs DMZ Sentry custom detector
-```
-
-For sim-to-real credibility, prefer real or physically grounded environment inputs:
-
-- Orthophoto/satellite image for `--terrain-texture` with `--terrain-texture-scale 1`
-- DEM/heightmap in a later terrain import step
-- PBR ground material maps for close camera realism:
-  - albedo/basecolor
-  - normal
-  - roughness
-- Sketchfab or other licensed USD/OBJ/FBX assets for props such as guard posts, fences, barriers, signs, boats, and human characters
-
-Keep source/license notes for every downloaded asset in `docs/assets.md`.
-
-## YOLO Person Detection
-
-Install the detector dependency once:
-
-```bash
-python3 -m pip install --user ultralytics
-```
-
-Build the ROS 2 workspace:
-
-```bash
-cd /home/rokey/dev_ws/dmz_sentry/ros2_ws
-source /opt/ros/humble/setup.bash
-colcon build --symlink-install
-```
-
-Run Isaac Sim first:
-
-```bash
-cd /home/rokey/dev_ws/dmz_sentry
-./scripts/demo_dmz_sim.sh
-```
-
-In another terminal, start the detector:
-
-```bash
-cd /home/rokey/dev_ws/dmz_sentry
-./scripts/demo_yolo_detector.sh
-```
-
-Outputs:
-
-- `/detections_text`: JSON string detections
-- `/alerts`: alert JSON string when a person crosses the confidence threshold
-- `/camera/annotated`: optional camera image with YOLO boxes
-
-By default, annotated image publishing is off to keep the system light. Use `/detections_text` and `/alerts` for robot logic:
-
-```bash
-YOLO_PUBLISH_ANNOTATED=false ./scripts/demo_yolo_detector.sh
-```
-
-To inspect bounding boxes in rqt:
-
-```bash
-./scripts/demo_yolo_detector.sh
-```
-
-Then view `/camera/annotated` in `rqt_image_view`. If the view lags, keep `YOLO_ANNOTATED_SCALE=0.5` or disable annotated publishing and rely on `/detections_text` and `/alerts`.
-
-## Workspace Layout
-
-```text
-dmz_sentry/
-  isaacsim/          Isaac Sim standalone scripts
-  scripts/           Run/check helper scripts
-  ros2_ws/src/       Future ROS 2 packages
-  web/tactical_map/  Browser tactical map for odom, patrol state, and alerts
-  assets/textures/   Satellite/orthophoto terrain textures
-  docs/              Notes and diagrams
-  media/             Screenshots and demo captures
-```
-
-From now on, edit `isaacsim/anymal_gp_terrain.py` here instead of editing the Isaac Sim `_build/release` example folder directly.
-
-------------------------------------------------------------------
-
-5.18 기준 최종 터미널 명령어
-```bash
-# Terminal 1
-./scripts/demo_dmz_sim.sh
-
-# Terminal 2
-./scripts/demo_nav2_bringup.sh
-
-# Terminal 3
-./scripts/demo_nav2_patrol_controller.sh
-
-# Terminal 4
-./scripts/demo_yolo_detector.sh
-
-# Terminal 5
-./scripts/demo_rosbridge.sh
-
-# Terminal 6
-./scripts/demo_tactical_map.sh
+/inspection_camera/image_raw
 ```
