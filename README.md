@@ -370,3 +370,26 @@ dmz_sentry/
 ```
 
 From now on, edit `isaacsim/anymal_gp_terrain.py` here instead of editing the Isaac Sim `_build/release` example folder directly.
+
+------------------------------------------------------------------
+
+5.18 기준 최종 터미널 명령어
+```bash
+# Terminal 1
+./scripts/demo_dmz_sim.sh
+
+# Terminal 2
+./scripts/demo_nav2_bringup.sh
+
+# Terminal 3
+./scripts/demo_nav2_patrol_controller.sh
+
+# Terminal 4
+./scripts/demo_yolo_detector.sh
+
+# Terminal 5
+./scripts/demo_rosbridge.sh
+
+# Terminal 6
+./scripts/demo_tactical_map.sh
+```
