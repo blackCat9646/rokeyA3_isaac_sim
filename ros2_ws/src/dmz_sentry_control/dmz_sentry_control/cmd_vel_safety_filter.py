@@ -15,7 +15,7 @@ class CmdVelSafetyFilter(Node):
 
         self.declare_parameter("input_topic", "/cmd_vel_nav2_raw")
         self.declare_parameter("output_topic", "/cmd_vel")
-        self.declare_parameter("max_linear_x", 0.65)
+        self.declare_parameter("max_linear_x", 1.0)
         self.declare_parameter("max_angular_z", 0.85)
         self.declare_parameter("turn_enter_angular", 0.32)
         self.declare_parameter("turn_exit_angular", 0.10)

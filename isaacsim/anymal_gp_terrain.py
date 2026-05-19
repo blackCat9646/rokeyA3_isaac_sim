@@ -122,7 +122,7 @@ parser.add_argument(
 parser.add_argument(
     "--lidar-mount",
     choices=("follow", "robot", "world"),
-    default="world",
+    default="robot",
     help="Use world for a fixed RTX LiDAR debug pose, robot for direct child mount, or follow for experimental ANYmal tracking.",
 )
 parser.add_argument("--no-intruder", action="store_true", help="Disable the moving intruder scenario.")
@@ -230,6 +230,8 @@ INSPECTION_CAMERA_NAME = "SentryInspectionCamera"
 LIDAR_NAME = "SentryLidar"
 FRONT_CAMERA_TRANSLATION = (0.95, 0.0, 0.64)
 INSPECTION_CAMERA_LOCAL_OFFSET = (0.35, 0.0, 1.18)
+LIDAR_LOCAL_TRANSLATION = (0.18, 0.0, 1.05)
+LIDAR_ORIENTATION_IJKR = (0.0, 0.0, 0.0, 1.0)
 INSPECTION_CAMERA_DEFAULT_FOCAL_LENGTH = 35.0
 INSPECTION_CAMERA_MIN_FOCAL_LENGTH = 18.0
 INSPECTION_CAMERA_MAX_FOCAL_LENGTH = 90.0
@@ -1697,6 +1699,7 @@ def _setup_ros2_camera_graph(
                 ("cameraHelperRgb", "isaacsim.ros2.bridge.ROS2CameraHelper"),
                 ("cameraHelperInfo", "isaacsim.ros2.bridge.ROS2CameraInfoHelper"),
                 ("cameraHelperDepth", "isaacsim.ros2.bridge.ROS2CameraHelper"),
+                ("cameraHelperPointCloud", "isaacsim.ros2.bridge.ROS2CameraHelper"),
             ],
             keys.CONNECT: [
                 ("OnTick.outputs:tick", "createViewport.inputs:execIn"),
@@ -1707,9 +1710,11 @@ def _setup_ros2_camera_graph(
                 ("setCamera.outputs:execOut", "cameraHelperRgb.inputs:execIn"),
                 ("setCamera.outputs:execOut", "cameraHelperInfo.inputs:execIn"),
                 ("setCamera.outputs:execOut", "cameraHelperDepth.inputs:execIn"),
+                ("setCamera.outputs:execOut", "cameraHelperPointCloud.inputs:execIn"),
                 ("getRenderProduct.outputs:renderProductPath", "cameraHelperRgb.inputs:renderProductPath"),
                 ("getRenderProduct.outputs:renderProductPath", "cameraHelperInfo.inputs:renderProductPath"),
                 ("getRenderProduct.outputs:renderProductPath", "cameraHelperDepth.inputs:renderProductPath"),
+                ("getRenderProduct.outputs:renderProductPath", "cameraHelperPointCloud.inputs:renderProductPath"),
             ],
             keys.SET_VALUES: [
                 ("createViewport.inputs:name", viewport_name),
@@ -1722,6 +1727,9 @@ def _setup_ros2_camera_graph(
                 ("cameraHelperDepth.inputs:frameId", frame_id),
                 ("cameraHelperDepth.inputs:topicName", f"{topic_prefix}/depth"),
                 ("cameraHelperDepth.inputs:type", "depth"),
+                ("cameraHelperPointCloud.inputs:frameId", frame_id),
+                ("cameraHelperPointCloud.inputs:topicName", f"{topic_prefix}/points"),
+                ("cameraHelperPointCloud.inputs:type", "depth_pcl"),
                 ("setCamera.inputs:cameraPrim", [usdrt.Sdf.Path(camera_path)]),
             ],
         },
@@ -1761,18 +1769,20 @@ def _setup_ros2_lidar_graph(
     return ros_lidar_graph
 
 
-def _create_lidar_and_ros2_writer(lidar_path: str, translation=(0.18, 0.0, 1.05)):
+def _create_lidar_and_ros2_writer(lidar_path: str, translation=(0.18, 0.0, 1.05), parent_path: str | None = None):
+    command_path = f"/{Path(lidar_path).name}" if parent_path else lidar_path
     _, sensor = omni.kit.commands.execute(
         "IsaacSensorCreateRtxLidar",
-        path=lidar_path,
-        parent=None,
+        path=command_path,
+        parent=parent_path,
         config="Example_Rotary",
         translation=translation,
         orientation=Gf.Quatd(1.0, 0.0, 0.0, 0.0),
     )
+    lidar_path = str(sensor.GetPath())
 
     hydra_texture = rep.create.render_product(
-        sensor.GetPath(),
+        lidar_path,
         resolution=(128, 128),
         render_vars=["GenericModelOutput", "RtxSensorMetadata"],
         name="SentryLidar",
@@ -1836,33 +1846,58 @@ def _setup_ros2_tf_clock_graph(target_paths=None, graph_path: str = "/ROS2_Sentr
 
 def _setup_ros2_static_sensor_tf_graph(
     parent_frame_id: str,
+    include_lidar: bool = False,
     graph_path: str = "/ROS2_Sentry_StaticSensorTF",
 ) -> dict:
     keys = og.Controller.Keys
+    create_nodes = [
+        ("OnPlaybackTick", "omni.graph.action.OnPlaybackTick"),
+        ("ReadSimTime", "isaacsim.core.nodes.IsaacReadSimulationTime"),
+        ("PublishCameraTF", "isaacsim.ros2.bridge.ROS2PublishRawTransformTree"),
+    ]
+    connect = [
+        ("OnPlaybackTick.outputs:tick", "PublishCameraTF.inputs:execIn"),
+        ("ReadSimTime.outputs:simulationTime", "PublishCameraTF.inputs:timeStamp"),
+    ]
+    set_values = [
+        ("PublishCameraTF.inputs:topicName", "tf_static"),
+        ("PublishCameraTF.inputs:parentFrameId", parent_frame_id),
+        ("PublishCameraTF.inputs:childFrameId", FRONT_CAMERA_NAME),
+        ("PublishCameraTF.inputs:translation", list(FRONT_CAMERA_TRANSLATION)),
+        ("PublishCameraTF.inputs:rotation", list(FRONT_CAMERA_ORIENTATION_IJKR)),
+        ("PublishCameraTF.inputs:staticPublisher", True),
+    ]
+    if include_lidar:
+        create_nodes.append(("PublishLidarTF", "isaacsim.ros2.bridge.ROS2PublishRawTransformTree"))
+        connect.extend(
+            [
+                ("OnPlaybackTick.outputs:tick", "PublishLidarTF.inputs:execIn"),
+                ("ReadSimTime.outputs:simulationTime", "PublishLidarTF.inputs:timeStamp"),
+            ]
+        )
+        set_values.extend(
+            [
+                ("PublishLidarTF.inputs:topicName", "tf_static"),
+                ("PublishLidarTF.inputs:parentFrameId", parent_frame_id),
+                ("PublishLidarTF.inputs:childFrameId", LIDAR_NAME),
+                ("PublishLidarTF.inputs:translation", list(LIDAR_LOCAL_TRANSLATION)),
+                ("PublishLidarTF.inputs:rotation", list(LIDAR_ORIENTATION_IJKR)),
+                ("PublishLidarTF.inputs:staticPublisher", True),
+            ]
+        )
+
     (sensor_tf_graph, _, _, _) = og.Controller.edit(
         {"graph_path": graph_path, "evaluator_name": "execution"},
         {
-            keys.CREATE_NODES: [
-                ("OnPlaybackTick", "omni.graph.action.OnPlaybackTick"),
-                ("ReadSimTime", "isaacsim.core.nodes.IsaacReadSimulationTime"),
-                ("PublishCameraTF", "isaacsim.ros2.bridge.ROS2PublishRawTransformTree"),
-            ],
-            keys.CONNECT: [
-                ("OnPlaybackTick.outputs:tick", "PublishCameraTF.inputs:execIn"),
-                ("ReadSimTime.outputs:simulationTime", "PublishCameraTF.inputs:timeStamp"),
-            ],
-            keys.SET_VALUES: [
-                ("PublishCameraTF.inputs:topicName", "tf_static"),
-                ("PublishCameraTF.inputs:parentFrameId", parent_frame_id),
-                ("PublishCameraTF.inputs:childFrameId", FRONT_CAMERA_NAME),
-                ("PublishCameraTF.inputs:translation", list(FRONT_CAMERA_TRANSLATION)),
-                ("PublishCameraTF.inputs:rotation", list(FRONT_CAMERA_ORIENTATION_IJKR)),
-                ("PublishCameraTF.inputs:staticPublisher", True),
-            ],
+            keys.CREATE_NODES: create_nodes,
+            keys.CONNECT: connect,
+            keys.SET_VALUES: set_values,
         },
     )
     og.Controller.evaluate_sync(sensor_tf_graph)
     print(f"ROS 2 static sensor TF enabled: {parent_frame_id} -> {FRONT_CAMERA_NAME}")
+    if include_lidar:
+        print(f"ROS 2 static sensor TF enabled: {parent_frame_id} -> {LIDAR_NAME}")
     return {"graph": sensor_tf_graph}
 
 
@@ -1890,18 +1925,24 @@ def _setup_sentry_sensors(
 
     if lidar_mount in ("follow", "world"):
         lidar_path = f"/World/{LIDAR_NAME}"
+        lidar_parent_path = None
         lidar_translation = (0.0, -4.0, 1.6)
         if lidar_mount == "world":
             print("LiDAR debug mode: mounted at fixed world pose /World/SentryLidar")
         else:
             print("LiDAR follow mode: using /World/SentryLidar and updating it from ANYmal pose")
     else:
-        lidar_path = _make_child_path(mount_path, LIDAR_NAME)
-        lidar_translation = (0.18, 0.0, 1.05)
+        lidar_path = f"/{LIDAR_NAME}"
+        lidar_parent_path = mount_path
+        lidar_translation = LIDAR_LOCAL_TRANSLATION
 
     if enable_lidar:
-        lidar_handles = _create_lidar_and_ros2_writer(lidar_path, translation=lidar_translation)
-        tf_clock_targets = [lidar_path] if lidar_mount == "world" else []
+        lidar_handles = _create_lidar_and_ros2_writer(
+            lidar_path,
+            translation=lidar_translation,
+            parent_path=lidar_parent_path,
+        )
+        tf_clock_targets = [lidar_path] if lidar_mount in ("follow", "world") else []
     else:
         lidar_handles = {}
         tf_clock_targets = []
@@ -1910,7 +1951,8 @@ def _setup_sentry_sensors(
     simulation_app.update()
     sensor_topics = (
         "/camera/image_raw, /camera/depth, /camera/camera_info, "
-        "/inspection_camera/image_raw, /inspection_camera/depth, /inspection_camera/camera_info, /tf, /clock"
+        "/camera/points, /inspection_camera/image_raw, /inspection_camera/depth, "
+        "/inspection_camera/camera_info, /inspection_camera/points, /tf, /clock"
     )
     if enable_lidar:
         sensor_topics += ", /lidar/points"
@@ -1926,7 +1968,7 @@ def _setup_sentry_sensors(
         },
         "lidar": lidar_handles,
         "lidar_mount_mode": lidar_mount,
-        "lidar_local_offset": np.array([0.18, 0.0, 1.05]),
+        "lidar_local_offset": np.array(LIDAR_LOCAL_TRANSLATION),
         "tf_clock_graph": tf_clock_graph,
     }
 
@@ -2148,11 +2190,14 @@ class Anymal_runner(object):
         print(f"ANYmal odometry chassis prim: {self._chassis_prim_path}")
         self._static_sensor_tf_handles = None
         if enable_ros2_sensors:
-            self._static_sensor_tf_handles = _setup_ros2_static_sensor_tf_graph(self._chassis_frame_id)
-        self._lidar_follow_enabled = False
+            self._static_sensor_tf_handles = _setup_ros2_static_sensor_tf_graph(
+                self._chassis_frame_id,
+                include_lidar=enable_ros2_lidar and lidar_mount == "robot",
+            )
+        self._lidar_follow_enabled = self._ros_sensor_handles.get("lidar_mount_mode") == "follow"
         self._lidar_follow_translate_op = None
         self._lidar_follow_orient_op = None
-        self._lidar_follow_offset = np.array([0.18, 0.0, 1.05])
+        self._lidar_follow_offset = np.array(LIDAR_LOCAL_TRANSLATION)
         if self._lidar_follow_enabled:
             self._setup_lidar_follow_xform()
 
