@@ -23,6 +23,10 @@ const state = {
   trail: [],
   route: [],
   intruders: [],
+  selectedTargetId: null,
+  confirmedTargetIds: new Set(),
+  lastTargetPositions: new Map(),
+  lastDetection: null,
   lastIntruderStateTime: 0,
   lastAlert: null,
   lastAlertTime: 0,
@@ -76,6 +80,7 @@ function connectRosbridge() {
     subscribe("/patrol_state", "std_msgs/String");
     subscribe("/intruder_states", "std_msgs/String");
     advertise("/mission_command", "std_msgs/String");
+    advertise("/inspection_camera/command", "std_msgs/String");
   });
 
   socket.addEventListener("close", () => {
@@ -130,6 +135,40 @@ function publishMission(command) {
   logEvent(`mission command: ${command}`);
 }
 
+function publishInspectionCommand(payload) {
+  sendPacket({
+    op: "publish",
+    topic: "/inspection_camera/command",
+    msg: { data: JSON.stringify(payload) },
+  });
+}
+
+function selectTarget(intruder) {
+  const id = intruder.id ?? 0;
+  state.selectedTargetId = id;
+  const target = {
+    action: "look_at",
+    target_id: id,
+    label: `unidentified target ${Number(id) + 1}`,
+    x: Number(intruder.x || 0),
+    y: Number(intruder.y || 0),
+    z: Number(intruder.z || 0) + 1.35,
+  };
+  publishInspectionCommand(target);
+  logEvent(`inspection camera target: ${target.label}`);
+}
+
+function publishZoom(action) {
+  publishInspectionCommand({ action });
+  logEvent(`inspection camera: ${action}`);
+}
+
+function publishInspectionMove(action) {
+  publishInspectionCommand({ action });
+  state.selectedTargetId = null;
+  logEvent(`inspection camera manual: ${action}`);
+}
+
 function yawFromQuaternion(q) {
   const sinyCosp = 2 * (q.w * q.z + q.x * q.y);
   const cosyCosp = 1 - 2 * (q.y * q.y + q.z * q.z);
@@ -152,6 +191,11 @@ function handleAlert(msg) {
   try {
     const payload = JSON.parse(msg.data);
     const confidence = Number(payload.confidence || 0);
+    state.lastDetection = {
+      confidence,
+      count: Number(payload.count || 1),
+      time: Date.now(),
+    };
     summary = `${payload.event || "person_detected"} confidence=${confidence.toFixed(2)} count=${payload.count || 1}`;
   } catch (error) {
     // Keep raw alert string.
@@ -164,7 +208,39 @@ function handleAlert(msg) {
 function handleIntruderStates(msg) {
   try {
     const payload = JSON.parse(msg.data);
-    state.intruders = Array.isArray(payload.intruders) ? payload.intruders : [];
+    const nextIntruders = Array.isArray(payload.intruders) ? payload.intruders : [];
+    const seenIds = new Set();
+    nextIntruders.forEach((intruder) => {
+      const id = Number(intruder.id ?? 0);
+      seenIds.add(id);
+      const x = Number(intruder.x || 0);
+      const y = Number(intruder.y || 0);
+      const previous = state.lastTargetPositions.get(id);
+      if (previous) {
+        const movedDistance = Math.hypot(x - previous.x, y - previous.y);
+        if (movedDistance > 6.0) {
+          state.confirmedTargetIds.delete(id);
+          if (state.selectedTargetId === id) {
+            state.selectedTargetId = null;
+          }
+          logEvent(`target respawned: unidentified target ${id + 1}`);
+        }
+      }
+      state.lastTargetPositions.set(id, { x, y });
+    });
+    Array.from(state.lastTargetPositions.keys()).forEach((id) => {
+      if (!seenIds.has(id)) {
+        state.lastTargetPositions.delete(id);
+        state.confirmedTargetIds.delete(id);
+      }
+    });
+    state.intruders = nextIntruders;
+    if (
+      state.selectedTargetId !== null &&
+      !state.intruders.some((intruder) => intruder.id === state.selectedTargetId)
+    ) {
+      state.selectedTargetId = null;
+    }
     state.lastIntruderStateTime = Date.now();
   } catch (error) {
     logEvent("failed to parse intruder states");
@@ -253,24 +329,42 @@ function drawMarker(x, y, label, color) {
 
 function drawIntruderMarker(intruder) {
   const p = worldToCanvas(Number(intruder.x || 0), Number(intruder.y || 0));
-  const label = `Person ${intruder.id ?? "?"}`;
+  const id = Number(intruder.id ?? 0);
+  const label = `Unidentified target ${id + 1}`;
+  const selected = state.selectedTargetId === intruder.id;
+  const confirmed = state.confirmedTargetIds.has(id);
+  const detectionFresh = state.lastDetection && Date.now() - state.lastDetection.time < 4500;
   ctx.save();
-  ctx.fillStyle = "rgba(255, 82, 82, 0.95)";
-  ctx.strokeStyle = "rgba(255, 214, 128, 0.88)";
-  ctx.lineWidth = 2;
+  ctx.fillStyle = confirmed
+    ? "rgba(54, 244, 154, 0.92)"
+    : detectionFresh
+      ? "rgba(255, 82, 82, 0.95)"
+      : "rgba(255, 141, 58, 0.9)";
+  ctx.strokeStyle = selected ? "rgba(58, 216, 255, 0.95)" : "rgba(255, 214, 128, 0.88)";
+  ctx.lineWidth = selected ? 3 : 2;
   ctx.beginPath();
   ctx.arc(p.x, p.y, 7, 0, Math.PI * 2);
   ctx.fill();
   ctx.stroke();
-  ctx.beginPath();
-  ctx.arc(p.x, p.y, 15 + 3 * Math.sin(Date.now() / 220), 0, Math.PI * 2);
-  ctx.strokeStyle = "rgba(255, 82, 82, 0.28)";
-  ctx.stroke();
+  if (detectionFresh || selected) {
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, 15 + 3 * Math.sin(Date.now() / 220), 0, Math.PI * 2);
+    ctx.strokeStyle = selected ? "rgba(58, 216, 255, 0.32)" : "rgba(255, 82, 82, 0.28)";
+    ctx.stroke();
+  }
   ctx.fillStyle = "rgba(255, 214, 128, 0.94)";
   ctx.font = "12px monospace";
   ctx.fillText(label, p.x + 11, p.y - 10);
   ctx.fillStyle = "rgba(200, 246, 223, 0.76)";
   ctx.fillText(`x ${Number(intruder.x || 0).toFixed(1)} / y ${Number(intruder.y || 0).toFixed(1)}`, p.x + 11, p.y + 4);
+  if (confirmed) {
+    ctx.fillStyle = "rgba(54, 244, 154, 0.92)";
+    ctx.fillText("CONFIRMED", p.x + 11, p.y + 18);
+  }
+  if (selected) {
+    ctx.fillStyle = "rgba(58, 216, 255, 0.92)";
+    ctx.fillText("INSPECTION CAMERA", p.x + 11, p.y + (confirmed ? 32 : 18));
+  }
   ctx.restore();
 }
 
@@ -344,19 +438,40 @@ function updateText() {
   const alertActive = Date.now() - state.lastAlertTime < 4500;
   alertBlock.classList.toggle("active", alertActive);
   if (alertActive && state.lastAlert) {
-    const intruderSummary = state.intruders.length
-      ? ` | ${state.intruders.length} tracked on map`
+    const targetSummary = state.intruders.length
+      ? ` | ${state.intruders.length} target(s) on map`
       : "";
-    alertText.textContent = `${state.lastAlert}${intruderSummary}`;
+    alertText.textContent = `${state.lastAlert}${targetSummary}`;
   } else {
-    const intruderFresh = Date.now() - state.lastIntruderStateTime < 3000;
-    if (intruderFresh && state.intruders.length) {
-      alertText.textContent = `${state.intruders.length} intruder position(s) tracked`;
-    } else if (!intruderFresh) {
-      alertText.textContent = "No intruder telemetry";
+    if (state.intruders.length) {
+      const confirmedCount = state.intruders.filter((intruder) => state.confirmedTargetIds.has(Number(intruder.id ?? 0))).length;
+      alertText.textContent = `${state.intruders.length} target(s) available / ${confirmedCount} confirmed`;
+    } else if (Date.now() - state.lastIntruderStateTime >= 3000) {
+      alertText.textContent = "No target telemetry";
     } else {
       alertText.textContent = "No active alert";
     }
+  }
+}
+
+function handleMapClick(event) {
+  const rect = canvas.getBoundingClientRect();
+  const click = {
+    x: event.clientX - rect.left,
+    y: event.clientY - rect.top,
+  };
+  let best = null;
+  let bestDistance = Infinity;
+  state.intruders.forEach((intruder) => {
+    const p = worldToCanvas(Number(intruder.x || 0), Number(intruder.y || 0));
+    const distance = Math.hypot(click.x - p.x, click.y - p.y);
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      best = intruder;
+    }
+  });
+  if (best && bestDistance <= 28) {
+    selectTarget(best);
   }
 }
 
@@ -370,6 +485,23 @@ document.getElementById("launchBtn").addEventListener("click", () => publishMiss
 document.getElementById("homeBtn").addEventListener("click", () => publishMission("go_home"));
 document.getElementById("stopBtn").addEventListener("click", () => publishMission("stop"));
 document.getElementById("resumeBtn").addEventListener("click", () => publishMission("resume"));
+document.getElementById("zoomInBtn").addEventListener("click", () => publishZoom("zoom_in"));
+document.getElementById("zoomOutBtn").addEventListener("click", () => publishZoom("zoom_out"));
+document.getElementById("zoomResetBtn").addEventListener("click", () => publishZoom("zoom_reset"));
+document.getElementById("panLeftBtn").addEventListener("click", () => publishInspectionMove("pan_left"));
+document.getElementById("panRightBtn").addEventListener("click", () => publishInspectionMove("pan_right"));
+document.getElementById("tiltUpBtn").addEventListener("click", () => publishInspectionMove("tilt_up"));
+document.getElementById("tiltDownBtn").addEventListener("click", () => publishInspectionMove("tilt_down"));
+document.getElementById("centerCameraBtn").addEventListener("click", () => publishInspectionMove("center"));
+document.getElementById("clearTargetBtn").addEventListener("click", () => {
+  if (state.selectedTargetId !== null) {
+    state.confirmedTargetIds.add(Number(state.selectedTargetId));
+    logEvent(`target confirmed: unidentified target ${Number(state.selectedTargetId) + 1}`);
+  }
+  state.selectedTargetId = null;
+  publishZoom("clear");
+});
+canvas.addEventListener("click", handleMapClick);
 window.addEventListener("resize", resizeCanvas);
 
 resizeCanvas();

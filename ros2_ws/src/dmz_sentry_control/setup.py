@@ -25,6 +25,7 @@ setup(
     entry_points={
         "console_scripts": [
             "cmd_vel_safety_filter = dmz_sentry_control.cmd_vel_safety_filter:main",
+            "inspection_bridge = dmz_sentry_control.inspection_bridge:main",
             "nav2_patrol_controller = dmz_sentry_control.nav2_patrol_controller:main",
             "patrol_controller = dmz_sentry_control.patrol_controller:main",
         ],

@@ -41,6 +41,8 @@ from pxr import Gf, Sdf, Usd, UsdGeom, UsdLux, UsdPhysics, UsdShade
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_GUARD_TOWER_ASSET = PROJECT_ROOT / "assets/props/guard_tower/Guard_Tower_Free_Asset.usdz"
 DEFAULT_CHAINLINK_FENCE_ASSET = PROJECT_ROOT / "assets/props/chainlink_fence/chainlink_fence_tileable.usdz"
+INSPECTION_COMMAND_FILE = Path("/tmp/dmz_sentry_inspection_command.json")
+INTRUDER_STATES_FILE = Path("/tmp/dmz_sentry_intruder_states.json")
 
 parser = argparse.ArgumentParser()
 parser.add_argument(
@@ -224,8 +226,16 @@ if not args.no_intruder and args.intruder_visual in ("auto", "isaac-human"):
     simulation_app.update()
 
 FRONT_CAMERA_NAME = "SentryFrontCamera"
+INSPECTION_CAMERA_NAME = "SentryInspectionCamera"
 LIDAR_NAME = "SentryLidar"
 FRONT_CAMERA_TRANSLATION = (0.95, 0.0, 0.64)
+INSPECTION_CAMERA_LOCAL_OFFSET = (0.35, 0.0, 1.18)
+INSPECTION_CAMERA_DEFAULT_FOCAL_LENGTH = 35.0
+INSPECTION_CAMERA_MIN_FOCAL_LENGTH = 18.0
+INSPECTION_CAMERA_MAX_FOCAL_LENGTH = 90.0
+INSPECTION_CAMERA_PAN_STEP_DEG = 8.0
+INSPECTION_CAMERA_TILT_STEP_DEG = 5.0
+INSPECTION_CAMERA_MAX_TILT_DEG = 70.0
 # USD camera local -Z looks forward. This quaternion points it along robot +X
 # while keeping robot +Z as image up, so the viewport is not rolled sideways.
 FRONT_CAMERA_ORIENTATION_IJKR = (0.5, -0.5, -0.5, 0.5)
@@ -279,6 +289,82 @@ class _OptionalRosStringPublisher:
             self._node = None
         if self._owns_context and self._rclpy is not None and self._rclpy.ok():
             self._rclpy.shutdown()
+
+
+class _OptionalRosStringSubscriber:
+    def __init__(self, node_name: str, topic_name: str) -> None:
+        self._rclpy = None
+        self._node = None
+        self._subscription = None
+        self._messages = []
+        self._owns_context = False
+
+        try:
+            import rclpy
+            from std_msgs.msg import String
+        except Exception as exc:
+            carb.log_warn(f"ROS 2 Python subscriber unavailable for {topic_name}: {exc}")
+            return
+
+        try:
+            if not rclpy.ok():
+                rclpy.init(args=None)
+                self._owns_context = True
+            self._node = rclpy.create_node(node_name)
+            self._subscription = self._node.create_subscription(String, topic_name, self._on_message, 10)
+            self._rclpy = rclpy
+            print(f"ROS 2 string subscriber enabled: {topic_name}")
+        except Exception as exc:
+            carb.log_warn(f"Failed to create ROS 2 Python subscriber for {topic_name}: {exc}")
+
+    def _on_message(self, msg) -> None:
+        self._messages.append(msg.data)
+        if len(self._messages) > 10:
+            self._messages = self._messages[-10:]
+
+    def poll(self) -> list[str]:
+        if self._rclpy is not None and self._node is not None:
+            self._rclpy.spin_once(self._node, timeout_sec=0.0)
+        messages = self._messages
+        self._messages = []
+        return messages
+
+    def shutdown(self) -> None:
+        if self._node is not None:
+            self._node.destroy_node()
+            self._node = None
+        if self._owns_context and self._rclpy is not None and self._rclpy.ok():
+            self._rclpy.shutdown()
+
+
+class _FileStringMailbox:
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._last_sequence = None
+
+    def poll(self) -> list[str]:
+        try:
+            payload = json.loads(self._path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return []
+        except Exception as exc:
+            carb.log_warn(f"Failed to read inspection command file {self._path}: {exc}")
+            return []
+
+        sequence = payload.get("sequence")
+        if sequence is not None and sequence == self._last_sequence:
+            return []
+        self._last_sequence = sequence
+
+        data = payload.get("data")
+        if isinstance(data, str):
+            return [data]
+        if isinstance(data, dict):
+            return [json.dumps(data)]
+        return []
+
+    def shutdown(self) -> None:
+        return
 
 
 def _smoothstep(value: np.ndarray) -> np.ndarray:
@@ -463,6 +549,56 @@ def _sample_height(x_values: np.ndarray, y_values: np.ndarray, heights: np.ndarr
     h01 = heights[row + 1, col]
     h11 = heights[row + 1, col + 1]
     return float((1.0 - tx) * (1.0 - ty) * h00 + tx * (1.0 - ty) * h10 + (1.0 - tx) * ty * h01 + tx * ty * h11)
+
+
+def _normalize_vector(vector: np.ndarray, fallback) -> np.ndarray:
+    norm = float(np.linalg.norm(vector))
+    if norm < 1e-6:
+        return np.asarray(fallback, dtype=float)
+    return np.asarray(vector, dtype=float) / norm
+
+
+def _quat_wxyz_from_rotation_matrix(matrix: np.ndarray) -> tuple[float, float, float, float]:
+    trace = float(matrix[0, 0] + matrix[1, 1] + matrix[2, 2])
+    if trace > 0.0:
+        scale = np.sqrt(trace + 1.0) * 2.0
+        w = 0.25 * scale
+        x = (matrix[2, 1] - matrix[1, 2]) / scale
+        y = (matrix[0, 2] - matrix[2, 0]) / scale
+        z = (matrix[1, 0] - matrix[0, 1]) / scale
+    elif matrix[0, 0] > matrix[1, 1] and matrix[0, 0] > matrix[2, 2]:
+        scale = np.sqrt(1.0 + matrix[0, 0] - matrix[1, 1] - matrix[2, 2]) * 2.0
+        w = (matrix[2, 1] - matrix[1, 2]) / scale
+        x = 0.25 * scale
+        y = (matrix[0, 1] + matrix[1, 0]) / scale
+        z = (matrix[0, 2] + matrix[2, 0]) / scale
+    elif matrix[1, 1] > matrix[2, 2]:
+        scale = np.sqrt(1.0 + matrix[1, 1] - matrix[0, 0] - matrix[2, 2]) * 2.0
+        w = (matrix[0, 2] - matrix[2, 0]) / scale
+        x = (matrix[0, 1] + matrix[1, 0]) / scale
+        y = 0.25 * scale
+        z = (matrix[1, 2] + matrix[2, 1]) / scale
+    else:
+        scale = np.sqrt(1.0 + matrix[2, 2] - matrix[0, 0] - matrix[1, 1]) * 2.0
+        w = (matrix[1, 0] - matrix[0, 1]) / scale
+        x = (matrix[0, 2] + matrix[2, 0]) / scale
+        y = (matrix[1, 2] + matrix[2, 1]) / scale
+        z = 0.25 * scale
+    quat = np.asarray([w, x, y, z], dtype=float)
+    quat /= max(1e-9, float(np.linalg.norm(quat)))
+    return float(quat[0]), float(quat[1]), float(quat[2]), float(quat[3])
+
+
+def _camera_look_at_quat(camera_position: np.ndarray, target_position: np.ndarray) -> tuple[float, float, float, float]:
+    forward = _normalize_vector(target_position - camera_position, (1.0, 0.0, 0.0))
+    z_axis = -forward
+    world_up = np.asarray((0.0, 0.0, 1.0), dtype=float)
+    if abs(float(np.dot(z_axis, world_up))) > 0.98:
+        world_up = np.asarray((0.0, 1.0, 0.0), dtype=float)
+    x_axis = _normalize_vector(np.cross(world_up, z_axis), (0.0, -1.0, 0.0))
+    y_axis = _normalize_vector(np.cross(z_axis, x_axis), (0.0, 0.0, 1.0))
+    rotation = np.column_stack((x_axis, y_axis, z_axis))
+    return _quat_wxyz_from_rotation_matrix(rotation)
 
 
 def _set_xform(prim, translate, scale=None, rotate_xyz=None) -> None:
@@ -996,8 +1132,8 @@ class IntruderScenario:
 
     def _respawn_intruder(self, state: dict) -> None:
         x_limit = self._terrain_size * 0.30
-        start_y_min = min(self._y_values[-1] - 2.0, self._fence_y + 2.0)
-        start_y_max = min(self._y_values[-1] - 1.0, self._fence_y + max(4.5, self._river_width * 0.28))
+        start_y_min = min(self._y_values[-1] - 2.0, self._fence_y + max(8.0, self._river_width * 0.45))
+        start_y_max = min(self._y_values[-1] - 1.0, self._fence_y + max(14.0, self._river_width * 0.78))
         if start_y_max <= start_y_min:
             start_y_max = start_y_min + 0.5
 
@@ -1504,6 +1640,21 @@ def _create_front_camera(stage, camera_path: str) -> str:
     return camera_path
 
 
+def _create_inspection_camera(stage, camera_path: str) -> str:
+    camera = UsdGeom.Camera.Define(stage, Sdf.Path(camera_path))
+    xformable = UsdGeom.Xformable(camera.GetPrim())
+    xformable.ClearXformOpOrder()
+    xformable.AddTranslateOp(UsdGeom.XformOp.PrecisionDouble).Set(Gf.Vec3d(0.0, 0.0, 1.2))
+    xformable.AddOrientOp(UsdGeom.XformOp.PrecisionDouble).Set(Gf.Quatd(1.0, Gf.Vec3d(0.0, 0.0, 0.0)))
+    camera.GetHorizontalApertureAttr().Set(21.0)
+    camera.GetVerticalApertureAttr().Set(16.0)
+    camera.GetProjectionAttr().Set("perspective")
+    camera.GetFocalLengthAttr().Set(INSPECTION_CAMERA_DEFAULT_FOCAL_LENGTH)
+    camera.GetFocusDistanceAttr().Set(20.0)
+    camera.GetClippingRangeAttr().Set(Gf.Vec2f(0.05, 300.0))
+    return camera_path
+
+
 def _add_sensor_visual_markers(stage, mount_path: str) -> None:
     _add_cube(
         stage,
@@ -1522,7 +1673,14 @@ def _add_sensor_visual_markers(stage, mount_path: str) -> None:
     )
 
 
-def _setup_ros2_camera_graph(camera_path: str, graph_path: str = "/ROS2_Sentry_Camera"):
+def _setup_ros2_camera_graph(
+    camera_path: str,
+    graph_path: str = "/ROS2_Sentry_Camera",
+    viewport_name: str = "ROS2_Sentry_CameraViewport",
+    viewport_id: int = 1,
+    frame_id: str = FRONT_CAMERA_NAME,
+    topic_prefix: str = "camera",
+):
     keys = og.Controller.Keys
     (ros_camera_graph, _, _, _) = og.Controller.edit(
         {
@@ -1554,15 +1712,15 @@ def _setup_ros2_camera_graph(camera_path: str, graph_path: str = "/ROS2_Sentry_C
                 ("getRenderProduct.outputs:renderProductPath", "cameraHelperDepth.inputs:renderProductPath"),
             ],
             keys.SET_VALUES: [
-                ("createViewport.inputs:name", "ROS2_Sentry_CameraViewport"),
-                ("createViewport.inputs:viewportId", 1),
-                ("cameraHelperRgb.inputs:frameId", "SentryFrontCamera"),
-                ("cameraHelperRgb.inputs:topicName", "camera/image_raw"),
+                ("createViewport.inputs:name", viewport_name),
+                ("createViewport.inputs:viewportId", int(viewport_id)),
+                ("cameraHelperRgb.inputs:frameId", frame_id),
+                ("cameraHelperRgb.inputs:topicName", f"{topic_prefix}/image_raw"),
                 ("cameraHelperRgb.inputs:type", "rgb"),
-                ("cameraHelperInfo.inputs:frameId", "SentryFrontCamera"),
-                ("cameraHelperInfo.inputs:topicName", "camera/camera_info"),
-                ("cameraHelperDepth.inputs:frameId", "SentryFrontCamera"),
-                ("cameraHelperDepth.inputs:topicName", "camera/depth"),
+                ("cameraHelperInfo.inputs:frameId", frame_id),
+                ("cameraHelperInfo.inputs:topicName", f"{topic_prefix}/camera_info"),
+                ("cameraHelperDepth.inputs:frameId", frame_id),
+                ("cameraHelperDepth.inputs:topicName", f"{topic_prefix}/depth"),
                 ("cameraHelperDepth.inputs:type", "depth"),
                 ("setCamera.inputs:cameraPrim", [usdrt.Sdf.Path(camera_path)]),
             ],
@@ -1716,9 +1874,19 @@ def _setup_sentry_sensors(
 ) -> dict:
     mount_path = _find_anymal_sensor_mount(stage, robot_path)
     camera_path = _make_child_path(mount_path, FRONT_CAMERA_NAME)
+    inspection_camera_path = f"/World/{INSPECTION_CAMERA_NAME}"
     _add_sensor_visual_markers(stage, mount_path)
     camera_path = _create_front_camera(stage, camera_path)
     camera_graph = _setup_ros2_camera_graph(camera_path)
+    inspection_camera_path = _create_inspection_camera(stage, inspection_camera_path)
+    inspection_camera_graph = _setup_ros2_camera_graph(
+        inspection_camera_path,
+        graph_path="/ROS2_Sentry_InspectionCamera",
+        viewport_name="ROS2_Sentry_InspectionViewport",
+        viewport_id=2,
+        frame_id=INSPECTION_CAMERA_NAME,
+        topic_prefix="inspection_camera",
+    )
 
     if lidar_mount in ("follow", "world"):
         lidar_path = f"/World/{LIDAR_NAME}"
@@ -1740,7 +1908,10 @@ def _setup_sentry_sensors(
         print("ROS 2 LiDAR disabled: camera, TF, and clock publishers remain enabled.")
     tf_clock_graph = _setup_ros2_tf_clock_graph(tf_clock_targets)
     simulation_app.update()
-    sensor_topics = "/camera/image_raw, /camera/depth, /camera/camera_info, /tf, /clock"
+    sensor_topics = (
+        "/camera/image_raw, /camera/depth, /camera/camera_info, "
+        "/inspection_camera/image_raw, /inspection_camera/depth, /inspection_camera/camera_info, /tf, /clock"
+    )
     if enable_lidar:
         sensor_topics += ", /lidar/points"
     print(f"ROS 2 sensors enabled: {sensor_topics}")
@@ -1749,6 +1920,10 @@ def _setup_sentry_sensors(
         "mount_path": mount_path,
         "camera_path": camera_path,
         "camera_graph": camera_graph,
+        "inspection_camera": {
+            "camera_path": inspection_camera_path,
+            "camera_graph": inspection_camera_graph,
+        },
         "lidar": lidar_handles,
         "lidar_mount_mode": lidar_mount,
         "lidar_local_offset": np.array([0.18, 0.0, 1.05]),
@@ -1952,6 +2127,22 @@ class Anymal_runner(object):
             if enable_ros2_sensors
             else {}
         )
+        self._inspection_camera_command_subscriber = _FileStringMailbox(INSPECTION_COMMAND_FILE) if enable_ros2_sensors else None
+        self._inspection_camera_ros_subscriber = (
+            _OptionalRosStringSubscriber("dmz_sentry_inspection_camera_command", "/inspection_camera/command")
+            if enable_ros2_sensors
+            else None
+        )
+        self._inspection_camera_translate_op = None
+        self._inspection_camera_orient_op = None
+        self._inspection_camera_focal_attr = None
+        self._inspection_camera_target = None
+        self._inspection_camera_focal_length = INSPECTION_CAMERA_DEFAULT_FOCAL_LENGTH
+        self._inspection_camera_offset = np.asarray(INSPECTION_CAMERA_LOCAL_OFFSET, dtype=float)
+        self._inspection_camera_manual_pan = 0.0
+        self._inspection_camera_manual_tilt = 0.0
+        if self._ros_sensor_handles.get("inspection_camera"):
+            self._setup_inspection_camera_xform()
         self._chassis_prim_path = self._ros_sensor_handles.get("mount_path") or _find_anymal_sensor_mount(self._stage)
         self._chassis_frame_id = self._chassis_prim_path.rsplit("/", 1)[-1] or "Anymal"
         print(f"ANYmal odometry chassis prim: {self._chassis_prim_path}")
@@ -2045,6 +2236,142 @@ class Anymal_runner(object):
             )
         )
 
+    def _setup_inspection_camera_xform(self) -> None:
+        camera_path = self._ros_sensor_handles["inspection_camera"]["camera_path"]
+        camera_prim = self._stage.GetPrimAtPath(camera_path)
+        if not camera_prim.IsValid():
+            carb.log_warn(f"Inspection camera prim not found at {camera_path}")
+            return
+
+        xformable = UsdGeom.Xformable(camera_prim)
+        xformable.ClearXformOpOrder()
+        self._inspection_camera_translate_op = xformable.AddTranslateOp(UsdGeom.XformOp.PrecisionDouble)
+        self._inspection_camera_orient_op = xformable.AddOrientOp(UsdGeom.XformOp.PrecisionDouble)
+        self._inspection_camera_focal_attr = UsdGeom.Camera(camera_prim).GetFocalLengthAttr()
+
+    def _rotation_matrix_from_quat_wxyz(self, orientation) -> np.ndarray:
+        quat = np.asarray(orientation, dtype=float)
+        w, x, y, z = quat
+        return np.array(
+            [
+                [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
+                [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
+                [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
+            ]
+        )
+
+    def _handle_inspection_camera_command(self, data: str) -> None:
+        try:
+            payload = json.loads(data)
+        except Exception:
+            carb.log_warn(f"Invalid inspection camera command: {data}")
+            return
+
+        action = str(payload.get("action", "look_at")).strip().lower()
+        if action in ("look_at", "track", "select"):
+            try:
+                x = float(payload["x"])
+                y = float(payload["y"])
+                z = float(payload.get("z", _sample_height(self._terrain_x_values, self._terrain_y_values, self._terrain_heights, x, y) + 1.3))
+            except Exception as exc:
+                carb.log_warn(f"Inspection camera look_at command missing target coordinates: {exc}")
+                return
+            self._inspection_camera_target = np.asarray((x, y, z), dtype=float)
+            print(f"Inspection camera tracking target: x={x:.2f}, y={y:.2f}, z={z:.2f}")
+        elif action in ("clear", "reset_target", "wide"):
+            self._inspection_camera_target = None
+            print("Inspection camera target cleared")
+        elif action == "pan_left":
+            self._inspection_camera_target = None
+            self._inspection_camera_manual_pan += np.deg2rad(INSPECTION_CAMERA_PAN_STEP_DEG)
+        elif action == "pan_right":
+            self._inspection_camera_target = None
+            self._inspection_camera_manual_pan -= np.deg2rad(INSPECTION_CAMERA_PAN_STEP_DEG)
+        elif action == "tilt_up":
+            self._inspection_camera_target = None
+            self._inspection_camera_manual_tilt += np.deg2rad(INSPECTION_CAMERA_TILT_STEP_DEG)
+            self._inspection_camera_manual_tilt = float(
+                np.clip(
+                    self._inspection_camera_manual_tilt,
+                    -np.deg2rad(INSPECTION_CAMERA_MAX_TILT_DEG),
+                    np.deg2rad(INSPECTION_CAMERA_MAX_TILT_DEG),
+                )
+            )
+        elif action == "tilt_down":
+            self._inspection_camera_target = None
+            self._inspection_camera_manual_tilt -= np.deg2rad(INSPECTION_CAMERA_TILT_STEP_DEG)
+            self._inspection_camera_manual_tilt = float(
+                np.clip(
+                    self._inspection_camera_manual_tilt,
+                    -np.deg2rad(INSPECTION_CAMERA_MAX_TILT_DEG),
+                    np.deg2rad(INSPECTION_CAMERA_MAX_TILT_DEG),
+                )
+            )
+        elif action in ("center", "manual_center"):
+            self._inspection_camera_target = None
+            self._inspection_camera_manual_pan = 0.0
+            self._inspection_camera_manual_tilt = 0.0
+        elif action == "zoom_in":
+            self._inspection_camera_focal_length = min(
+                INSPECTION_CAMERA_MAX_FOCAL_LENGTH,
+                self._inspection_camera_focal_length * 1.35,
+            )
+        elif action == "zoom_out":
+            self._inspection_camera_focal_length = max(
+                INSPECTION_CAMERA_MIN_FOCAL_LENGTH,
+                self._inspection_camera_focal_length / 1.35,
+            )
+        elif action == "zoom_reset":
+            self._inspection_camera_focal_length = INSPECTION_CAMERA_DEFAULT_FOCAL_LENGTH
+        elif action == "set_zoom":
+            self._inspection_camera_focal_length = float(
+                np.clip(
+                    float(payload.get("focal_length", self._inspection_camera_focal_length)),
+                    INSPECTION_CAMERA_MIN_FOCAL_LENGTH,
+                    INSPECTION_CAMERA_MAX_FOCAL_LENGTH,
+                )
+            )
+        else:
+            carb.log_warn(f"Unknown inspection camera command: {action}")
+
+    def _poll_inspection_camera_commands(self) -> None:
+        command_sources = (self._inspection_camera_command_subscriber, self._inspection_camera_ros_subscriber)
+        for source in command_sources:
+            if source is None:
+                continue
+            for message in source.poll():
+                self._handle_inspection_camera_command(message)
+
+    def _update_inspection_camera_pose(self) -> None:
+        if self._inspection_camera_translate_op is None or self._inspection_camera_orient_op is None:
+            return
+
+        position, orientation = self._anymal.robot.get_world_pose()
+        robot_position = np.asarray(position, dtype=float)
+        robot_rotation = self._rotation_matrix_from_quat_wxyz(orientation)
+        camera_position = robot_position + robot_rotation @ self._inspection_camera_offset
+
+        if self._inspection_camera_target is None:
+            pan = self._inspection_camera_manual_pan
+            tilt = self._inspection_camera_manual_tilt
+            forward_local = np.asarray(
+                (
+                    np.cos(tilt) * np.cos(pan),
+                    np.cos(tilt) * np.sin(pan),
+                    np.sin(tilt),
+                ),
+                dtype=float,
+            )
+            target_position = camera_position + robot_rotation @ (9.0 * forward_local)
+        else:
+            target_position = np.asarray(self._inspection_camera_target, dtype=float)
+
+        w, x, y, z = _camera_look_at_quat(camera_position, target_position)
+        self._inspection_camera_translate_op.Set(Gf.Vec3d(*[float(value) for value in camera_position]))
+        self._inspection_camera_orient_op.Set(Gf.Quatd(w, Gf.Vec3d(x, y, z)))
+        if self._inspection_camera_focal_attr is not None:
+            self._inspection_camera_focal_attr.Set(float(self._inspection_camera_focal_length))
+
     def _read_ros_cmd_vel_command(self) -> np.ndarray | None:
         if self._cmd_vel_handles is None:
             return None
@@ -2070,11 +2397,15 @@ class Anymal_runner(object):
         return self._keyboard_command
 
     def shutdown(self) -> None:
+        if self._inspection_camera_command_subscriber is not None:
+            self._inspection_camera_command_subscriber.shutdown()
+        if self._inspection_camera_ros_subscriber is not None:
+            self._inspection_camera_ros_subscriber.shutdown()
         if self._intruder_state_publisher is not None:
             self._intruder_state_publisher.shutdown()
 
     def _publish_intruder_states(self, force: bool = False) -> None:
-        if self._intruder_scenario is None or self._intruder_state_publisher is None:
+        if self._intruder_scenario is None:
             return
         if not force and self._sim_time - self._last_intruder_state_publish_time < 0.2:
             return
@@ -2084,7 +2415,12 @@ class Anymal_runner(object):
             "frame_id": "world",
             "intruders": self._intruder_scenario.get_intruder_reports(),
         }
-        self._intruder_state_publisher.publish(json.dumps(payload))
+        try:
+            INTRUDER_STATES_FILE.write_text(json.dumps(payload), encoding="utf-8")
+        except Exception as exc:
+            carb.log_warn(f"Failed to write intruder state file {INTRUDER_STATES_FILE}: {exc}")
+        if self._intruder_state_publisher is not None:
+            self._intruder_state_publisher.publish(json.dumps(payload))
         self._last_intruder_state_publish_time = self._sim_time
 
     def setup(self) -> None:
@@ -2105,16 +2441,19 @@ class Anymal_runner(object):
         """
         if self.first_step:
             self._anymal.initialize()
+            self._poll_inspection_camera_commands()
             if self._intruder_scenario is not None:
                 self._intruder_scenario.update(0.0)
                 self._publish_intruder_states(force=True)
             self._update_lidar_follow_pose()
+            self._update_inspection_camera_pose()
             self.first_step = False
         elif self.needs_reset:
             self._world.reset(True)
             self.needs_reset = False
             self.first_step = True
         else:
+            self._poll_inspection_camera_commands()
             self._base_command = self._get_active_base_command()
             self._anymal.forward(step_size, self._base_command)
             if self._intruder_scenario is not None:
@@ -2122,6 +2461,7 @@ class Anymal_runner(object):
                 self._sim_time += float(step_size)
                 self._publish_intruder_states()
             self._update_lidar_follow_pose()
+            self._update_inspection_camera_pose()
 
     def generate_replicator_dataset(
         self,

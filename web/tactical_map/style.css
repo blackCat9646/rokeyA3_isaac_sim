@@ -80,6 +80,11 @@ p {
   font-size: 12px;
 }
 
+p.hint {
+  margin-top: 10px;
+  line-height: 1.45;
+}
+
 .badge {
   border: 1px solid currentColor;
   padding: 7px 10px;
@@ -119,6 +124,13 @@ p {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 8px;
+}
+
+.ptz-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 8px;
+  margin-bottom: 8px;
 }
 
 button {
